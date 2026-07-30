@@ -220,8 +220,8 @@ def render_overview():
         return
 
     today = pd.to_datetime(datetime.utcnow().date())
-    df["RegistrationDate_dt"] = pd.to_datetime(df["RegistrationDate"], errors="coerce")
-df["ValidUpto_dt"] = pd.to_datetime(df["ValidUpto"], errors="coerce")
+    df["RegistrationDate_dt"] = pd.to_datetime(df["RegistrationDate"], dayfirst=True, errors="coerce")
+    df["ValidUpto_dt"] = pd.to_datetime(df["ValidUpto"], dayfirst=True, errors="coerce")
     df["IsExpired"] = df["ValidUpto_dt"].lt(today) | (df["Status_Clean"].str.lower().str.contains("exp", na=False))
     df["DaysToExpiry"] = (df["ValidUpto_dt"] - today).dt.days
     df["Year"] = df["RegistrationDate_dt"].dt.year
