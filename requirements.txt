@@ -1,6 +1,5 @@
-streamlit
+altair
 pandas
+streamlit==1.60.0
 plotly
-pymongo
-dnspython
-numpy
+starlette<1.4.0
