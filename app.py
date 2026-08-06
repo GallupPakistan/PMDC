@@ -242,7 +242,7 @@ def show_sidebar_navigation():
             f"""
             <div class="sidebar-footer">
                 <p style="margin:0 0 4px 0;"><b>Application Version:</b> 2.0.3</p>
-                <p style="margin:0 0 4px 0;"><b>Data Node:</b> Atlas Cluster Pipeline</p>
+                <p style="margin:0 0 4px 0;"><b>Data Node:</b> Static CSV Export</p>
                 <p style="margin:0 0 4px 0;"><b>Target Dataset Heap:</b> ~80k rows</p>
                 <p style="margin:0;"><b>Synchronized:</b> 2026-06-05</p>
             </div>
@@ -251,16 +251,21 @@ def show_sidebar_navigation():
         )
 
 def check_database_connection():
+    """Confirms the CSV data export is present and readable.
+
+    NOTE (2026-08-05): This used to ping MongoDB Atlas and count documents
+    per collection. The dashboard now reads from a static CSV export
+    (data/doctors_combined_full_all_qualifications.csv) instead - see
+    utils/data_loader.py for the full explanation. The function keeps its
+    old name/signature so the rest of app.py (which just wants a
+    True/False + a row count for the header banner) didn't need to change.
+    """
     try:
-        from utils.mongodb import get_mongo_collection
-        from utils.data_loader import COLLECTIONS
-        total = 0
-        for name in COLLECTIONS:
-            collection = get_mongo_collection(name)
-            total += collection.count_documents({})
-        return True, total
+        from utils.data_loader import load_all_data
+        df = load_all_data()
+        return True, len(df)
     except Exception as e:
-        logger.error(f"Database connection layer faulty execution: {e}")
+        logger.error(f"Data load layer faulty execution: {e}")
         return False, 0
 
 def show_header_banner(db_connected, doc_count):
@@ -316,8 +321,9 @@ def main():
         show_header_banner(db_connected, doc_count)
         if not db_connected:
             st.warning(
-                "⚠️ **No Database Detected (Running in Local/Mock Mode)**\n\n"
-                "To connect real data, ensure MongoDB Atlas credentials are added to **Settings -> Variables and Secrets** on Hugging Face."
+                "⚠️ **Data File Not Found**\n\n"
+                "Could not load `data/doctors_combined_full_all_qualifications.csv`. "
+                "Make sure this file is committed to the repository (same folder structure as on disk)."
             )
         load_page(st.session_state.page)
     except Exception as e:

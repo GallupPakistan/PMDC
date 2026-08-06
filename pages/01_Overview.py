@@ -323,7 +323,10 @@ def render_overview():
     c1, c2 = st.columns(2)
     with c1:
         # Secure top 4 + Others grouping to avoid infinite legend crash
-        t_counts = df["RegistrationType"].fillna("Unspecified").value_counts().reset_index()
+        # NOTE: .str.strip().str.title() normalizes case variants like
+        # "PERMANENT" vs "Permanent" so they don't split into separate
+        # legend entries - same technique used in pages/1_Doctor_Analytics.py.
+        t_counts = df["RegistrationType"].fillna("Unspecified").astype(str).str.strip().str.title().value_counts().reset_index()
         t_counts.columns = ["Type", "Count"]
         if len(t_counts) > 4:
             top_part = t_counts.head(4)

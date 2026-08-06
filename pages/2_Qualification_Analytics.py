@@ -337,7 +337,11 @@ def render_qualification_analytics():
             cum_growth["Cumulative_Volume"] = cum_growth["Volume"].cumsum()
             render_premium_chart(px.line, cum_growth, x="PassingYear", y="Cumulative_Volume", title="9. Historical Cumulative Inflow Velocity", color_discrete_sequence=["#E8C547"])
         with t1_r5_c2:
-            type_mix = primary.groupby(["source_label", "RegistrationType"]).size().reset_index(name="Volume")
+            # .str.strip().str.title() normalizes case variants like "PERMANENT"
+            # vs "Permanent" so they don't split into separate legend entries.
+            type_mix_src = primary.copy()
+            type_mix_src["RegistrationType"] = type_mix_src["RegistrationType"].astype(str).str.strip().str.title()
+            type_mix = type_mix_src.groupby(["source_label", "RegistrationType"]).size().reset_index(name="Volume")
             render_premium_chart(px.bar, type_mix, x="source_label", y="Volume", color="RegistrationType", barmode="stack", title="10. Operational Scope Mix inside Series", color_discrete_sequence=COLOR_SEQ)
 
     # ────────────────────────────────────────────────────────────────────────
@@ -415,7 +419,10 @@ def render_qualification_analytics():
             with t2_r5_c1:
                 render_premium_chart(px.box, gap_df, y="Years_To_Spec", title="9. Structural Transition Outliers Map", color_discrete_sequence=["#EF4444"])
             with t2_r5_c2:
-                track_spec = secondary.groupby(["source_label", "RegistrationType"]).size().reset_index(name="Count")
+                # Same case-normalization as the Tab 1 "Operational Scope Mix" chart above.
+                track_spec_src = secondary.copy()
+                track_spec_src["RegistrationType"] = track_spec_src["RegistrationType"].astype(str).str.strip().str.title()
+                track_spec = track_spec_src.groupby(["source_label", "RegistrationType"]).size().reset_index(name="Count")
                 render_premium_chart(px.bar, track_spec, x="source_label", y="Count", color="RegistrationType", title="10. Specialized Density Vectors Across Series", color_discrete_sequence=["#C9A84C", "#457B9D"])
 
     # ────────────────────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ Covers, with clear visuals and % figures:
 7. Each field's share of new specialists, year over year
 8. Gender ratio within each specialization, and its trend over time
 
-Data source: reads from MongoDB via utils.data_loader.load_all_data(), the same
+Data source: reads from the CSV export via utils.data_loader.load_all_data(), the same
 pipeline used by the rest of the dashboard.
 
 NOTES ON THIS VERSION:
@@ -126,7 +126,7 @@ def render_premium_chart(chart_func, *args, chart_height=380, **kwargs):
 # HERE, duplicated almost identically in Yearly Deep Dive too. Since
 # @st.cache_data caches by function identity, those were two totally
 # separate caches - visiting one page never helped the other, so the
-# expensive MongoDB fetch + qualification-flattening + gender/province
+# expensive CSV load + qualification-flattening + gender/province
 # inference ran again from scratch every time you switched pages (the
 # "stuck on Running load_and_enrich()" symptom). Now both pages share ONE
 # cached computation from utils/enriched_data.py.
@@ -158,7 +158,7 @@ def render_gender_specialization_deep_dive():
 
     df = load_and_enrich()
     if df.empty:
-        st.error("❌ No records returned from the database. Check the MongoDB connection/credentials.")
+        st.error("❌ No records returned. Check that data/doctors_combined_full_all_qualifications.csv is present.")
         return
 
     known_g = df[df["Gender"] != "Unknown"]

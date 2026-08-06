@@ -10,7 +10,7 @@ A single page to answer, for any year (through 2018):
 Every section pairs a chart with the underlying table, so numbers are never
 locked inside a visual only.
 
-Data source: reads from MongoDB via utils.data_loader.load_all_data(), the
+Data source: reads from the CSV export via utils.data_loader.load_all_data(), the
 same pipeline used by the rest of the dashboard. Gender/Province/Specialist
 signals come from the shared utils.gender_province module (see that file for
 the accuracy notes / fixes already applied dashboard-wide).
@@ -80,7 +80,7 @@ def kpi_card(label, value, sub=""):
 # HERE, duplicated almost identically in the Gender & Specialization page.
 # Since @st.cache_data caches by function identity, those were two totally
 # separate caches - visiting one page never helped the other, so the
-# expensive MongoDB fetch + qualification-flattening + gender/province
+# expensive CSV load + qualification-flattening + gender/province
 # inference ran again from scratch every time you switched pages (the
 # "stuck on Running load_and_enrich()" symptom). Now both pages share ONE
 # cached computation from utils/enriched_data.py.
@@ -155,7 +155,7 @@ def render_yearly_deep_dive():
 
     df = load_and_enrich()
     if df.empty:
-        st.error("❌ No records returned from the database. Check the MongoDB connection/credentials.")
+        st.error("❌ No records returned. Check that data/doctors_combined_full_all_qualifications.csv is present.")
         return
 
     include_mbbs = st.checkbox(
