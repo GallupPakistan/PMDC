@@ -116,6 +116,30 @@ def render_premium_chart(chart_func, *args, chart_height=380, **kwargs):
         )
         fig.update_xaxes(showgrid=False, zeroline=False, title_font=dict(color="#374151", size=10))
         fig.update_yaxes(gridcolor="rgba(0,0,0,0.08)", zeroline=False, title_font=dict(color="#374151", size=10))
+
+        # Force x-axis ticks to reach the actual max data year for any
+        # year-based chart (same fix as the Overview page's "Yearly
+        # Registration Velocity" chart): Plotly's auto-tick algorithm picks
+        # "nice" round intervals and sometimes stops short of the real max
+        # year - e.g. showing ticks only up to 2015 when the data (and the
+        # line/bars) actually continue to 2018 - silently hiding the tail
+        # end of the chart. Detected generically here (any x values that
+        # look like calendar years) so it self-applies to every chart in
+        # this file that plots something against RegYear/Specialty_Year,
+        # not just one hand-picked chart.
+        x_values = []
+        for trace in fig.data:
+            xs = getattr(trace, "x", None)
+            if xs is None:
+                continue
+            x_values.extend(v for v in xs if isinstance(v, (int, float)) and not pd.isna(v))
+        if x_values and 1900 <= min(x_values) and max(x_values) <= 2100:
+            year_min, year_max = int(min(x_values)), int(max(x_values))
+            tick_vals = list(range((year_min // 5) * 5, year_max + 1, 5))
+            if tick_vals[-1] != year_max:
+                tick_vals.append(year_max)
+            fig.update_xaxes(tickmode="array", tickvals=tick_vals)
+
         st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
     except Exception as e:
         logger.error(f"Chart render skip: {e}")
@@ -196,6 +220,18 @@ def render_gender_specialization_deep_dive():
     yr_wide = yr_df.groupby(["RegYear", "Gender"]).size().unstack(fill_value=0)
     yr_wide["Total"] = yr_wide.sum(axis=1)
     yr_wide["Female_%"] = (yr_wide.get("Female", 0) / yr_wide["Total"] * 100).round(1)
+    yr_wide["Male_%"] = (yr_wide.get("Male", 0) / yr_wide["Total"] * 100).round(1)
+
+    # % view alongside the raw-count view above, so the gender RATIO's
+    # movement over time is visible directly (a rising count of both genders
+    # can hide a shrinking/growing share - this makes the ratio itself explicit).
+    yr_pct_long = yr_wide.reset_index().melt(id_vars="RegYear", value_vars=["Female_%", "Male_%"],
+                                              var_name="Gender", value_name="Percent")
+    yr_pct_long["Gender"] = yr_pct_long["Gender"].str.replace("_%", "", regex=False)
+    render_premium_chart(px.line, yr_pct_long, x="RegYear", y="Percent", color="Gender", markers=True,
+                          title=f"Male vs Female Share of New Registrations, By Year - % (through {MAX_YEAR})",
+                          color_discrete_sequence=["#2A9D8F", "#E8C547"])
+
     early = yr_wide["Female_%"].head(5).mean()
     recent = yr_wide["Female_%"].tail(5).mean()
     direction = "risen" if recent > early else "fallen"
@@ -227,19 +263,75 @@ def render_gender_specialization_deep_dive():
     #    Now includes a breakdown by actual specialization degree type.
     # ------------------------------------------------------------------
     st.markdown("### Specialization Overview (Beyond MBBS/BDS)")
-    n_spec_series = int(df["Is_Specialist_Series"].sum())
-    n_spec_text = int(df["Is_Specialist"].sum())
+    # NOTE (fix): this used to show 3 bars - "Confirmed Specialists (S-Series)",
+    # "Declared 2nd Qualification", and "MBBS/BDS Only" - where the 3rd bar
+    # was only the complement of the 2nd (100% - Declared%), while the 1st
+    # bar was an entirely separate, OVERLAPPING signal layered on top. That's
+    # why the bars summed to 133%: a doctor can be BOTH an S-Series doctor
+    # AND have a declared 2nd qualification, or be in S-Series with no
+    # declared text specialty at all, etc. - the two flags aren't nested or
+    # exclusive, so adding all 3 as if they were parts of one 100% pie was
+    # mathematically wrong.
+    #
+    # Fixed by splitting into 4 MUTUALLY EXCLUSIVE buckets that cover every
+    # doctor exactly once, so the percentages always sum to 100%.
+    #
+    # Plain-language labels (2nd fix): "S-Series" and "Declared Qualification"
+    # are internal/technical terms from how PMDC's data is organized - not
+    # self-explanatory to someone looking at the chart cold. Each bucket now
+    # has (a) a short, descriptive x-axis label and (b) a plain-English
+    # definition box printed directly above the chart, so no one has to
+    # guess or ask what a bar means.
+    both_signals = df["Is_Specialist_Series"] & df["Is_Specialist"]
+    series_only = df["Is_Specialist_Series"] & ~df["Is_Specialist"]
+    declared_only = df["Is_Specialist"] & ~df["Is_Specialist_Series"]
+    neither = ~df["Is_Specialist_Series"] & ~df["Is_Specialist"]
+
+    n_both = int(both_signals.sum())
+    n_series_only = int(series_only.sum())
+    n_declared_only = int(declared_only.sum())
+    n_neither = int(neither.sum())
+
+    st.markdown(
+        """
+        <div style="background:#F9FAFB; border:1px solid #E5E7EB; border-radius:8px; padding:12px 16px; margin-bottom:14px;">
+        <p style="margin:0 0 6px 0; font-size:0.85rem; color:#374151;">
+        <b>What these 4 categories mean</b> — PMDC records "being a specialist" in two independent ways,
+        and a doctor can show up in either, both, or neither:
+        </p>
+        <ul style="margin:0; padding-left:1.1rem; font-size:0.8rem; color:#4B5563;">
+        <li><b>Registered in PMDC's Specialist Series</b> — the doctor's registration itself is filed under
+        PMDC's dedicated specialist registry (the "S-series"), separate from the general doctors list.</li>
+        <li><b>Has a Postgrad Degree on File</b> — regardless of which registry they're in, the doctor's own
+        qualification record explicitly lists a postgraduate specialization (e.g. FCPS, MD, MS).</li>
+        <li>Some doctors have <b>both</b>; some have <b>neither</b> (they only hold their base MBBS/BDS degree).</li>
+        </ul>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
     spec_kpi_df = pd.DataFrame({
-        "Category": ["Confirmed Specialists (S-Series)", "Declared 2nd Qualification", "MBBS/BDS Only"],
-        "Percent": [n_spec_series/total*100, n_spec_text/total*100, (total-n_spec_text)/total*100],
+        "Category": [
+            "Specialist Series Only<br>(no postgrad degree on file)",
+            "Postgrad Degree on File<br>(not in Specialist Series)",
+            "Both: Specialist Series<br>+ Postgrad Degree",
+            "MBBS/BDS Only<br>(no specialization either way)",
+        ],
+        "Percent": [n_series_only/total*100, n_declared_only/total*100, n_both/total*100, n_neither/total*100],
     })
     render_premium_chart(px.bar, spec_kpi_df, x="Category", y="Percent", text_auto=".2f",
-                          title="% of Registered Doctors by Specialization Status",
+                          title="% of Registered Doctors by Specialization Status (adds up to 100%)",
                           color_discrete_sequence=["#2A9D8F"])
-    c1, c2, c3 = st.columns(3)
-    with c1: kpi_card("Confirmed Specialists (S-Series)", f"{n_spec_series/total*100:.2f}%", f"{n_spec_series:,} doctors")
-    with c2: kpi_card("Declared 2nd Qualification", f"{n_spec_text/total*100:.2f}%", f"{n_spec_text:,} doctors")
-    with c3: kpi_card("MBBS/BDS Only", f"{(total-n_spec_text)/total*100:.2f}%", f"{total-n_spec_text:,} doctors")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi_card("Specialist Series Only", f"{n_series_only/total*100:.2f}%", f"{n_series_only:,} doctors")
+    with c2: kpi_card("Postgrad Degree on File", f"{n_declared_only/total*100:.2f}%", f"{n_declared_only:,} doctors")
+    with c3: kpi_card("Both", f"{n_both/total*100:.2f}%", f"{n_both:,} doctors")
+    with c4: kpi_card("MBBS/BDS Only", f"{n_neither/total*100:.2f}%", f"{n_neither:,} doctors")
+    st.markdown("<p class='insight-text' style='color:#6B7280;font-size:0.8rem;font-style:italic;'>"
+                "These 4 categories are mutually exclusive and sum to 100% - every doctor is counted in exactly one.</p>",
+                unsafe_allow_html=True)
+    n_spec_text = int(df["Is_Specialist"].sum())  # still used below for the degree-type breakdown
 
     st.markdown("#### Specialization Degree Types")
     deg_counts = df["Specialist_Degree"].dropna()
@@ -359,10 +451,16 @@ def render_gender_specialization_deep_dive():
         pt = fd.groupby(["Period", "Gender"]).size().unstack(fill_value=0)
         pt["Total"] = pt.sum(axis=1)
         pt["Female_%"] = (pt.get("Female", 0) / pt["Total"] * 100).round(1)
-        render_premium_chart(px.bar, pt.reset_index(), x="Period", y="Female_%", text_auto=".1f",
-                              title=f"Female Share of {field_for_trend} Over Time (through {MAX_YEAR})",
-                              color_discrete_sequence=["#C9A84C"])
-        st.dataframe(pt[["Total", "Female_%"]], use_container_width=True)
+        # Male % shown side by side with Female % (grouped bars, same pattern
+        # as "Gender % by Province" above) so the two always visibly sum to
+        # ~100% and any error is immediately obvious, rather than trusting a
+        # single Female-only bar in isolation.
+        pt["Male_%"] = (pt.get("Male", 0) / pt["Total"] * 100).round(1)
+        render_premium_chart(px.bar, pt.reset_index(), x="Period", y=["Female_%", "Male_%"], barmode="group",
+                              text_auto=".1f",
+                              title=f"Gender Split of {field_for_trend} Over Time (through {MAX_YEAR})",
+                              color_discrete_sequence=["#E8C547", "#2A9D8F"])
+        st.dataframe(pt[["Total", "Female_%", "Male_%"]], use_container_width=True)
     else:
         st.info("Not enough dated records for this field to show a reliable trend.")
 

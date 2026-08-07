@@ -15,15 +15,26 @@ same pipeline used by the rest of the dashboard. Gender/Province/Specialist
 signals come from the shared utils.gender_province module (see that file for
 the accuracy notes / fixes already applied dashboard-wide).
 
-MBBS/BDS INCLUSION:
-Earlier version of this page only tracked doctors with a real specialization
-(Speciality field filled in) — so MBBS/BDS-only doctors, who are the large
-majority, never showed up as a "field" anywhere. This version adds a unified
-"Field_All" column: specialists keep their actual specialty name, and every
-other doctor is labeled by their base degree (MBBS / BDS / etc., taken from
-their first qualification's Degree field). A toggle lets you include or
-exclude MBBS/BDS from the field charts, since it dwarfs every specialty by
-volume and can make the rest hard to compare on the same chart.
+MBBS/BDS INCLUSION (REVISED):
+An earlier version of this page let you toggle MBBS/BDS INTO the same
+"Leading Field" ranking as genuine postgraduate specialties (Cardiology,
+Family Medicine, etc.). That mixing was flagged as confusing - and rightly
+so: MBBS/BDS is the BASE degree almost every doctor holds, not a
+specialization, so including it always makes it "win" every year's Leading
+Field trivially, and blending it into a specialty legend implies it's the
+same *kind* of thing as a postgraduate specialty, which it isn't (same
+category-mixing issue already fixed elsewhere in this dashboard - see
+Overview's "Dominant Qualifications" chart and the Gender & Specialization
+page's "Specialization Overview" chart for the same fix pattern).
+
+Fixed by splitting into two clearly separate views instead of one blended
+toggle:
+1. "Leading Field" / "Top Field" analysis (Sections 2-4) now ALWAYS means
+   genuine postgraduate specialties only (Primary_Specialty/Specialty_Year) -
+   no toggle, no MBBS/BDS mixed in.
+2. A new, clearly-labeled "Base Degree Split, Every Year" section shows the
+   MBBS vs BDS breakdown on its own, so that information isn't lost - it's
+   just never blended into the specialty rankings.
 """
 import logging
 
@@ -90,16 +101,14 @@ from utils.enriched_data import load_and_enrich_all as load_and_enrich
 
 
 @st.cache_data(ttl=3600)
-def compute_field_df(include_mbbs: bool) -> pd.DataFrame:
-    """The filtered field-level DataFrame (specialties, or specialties+MBBS/BDS
-    if the toggle is on). Cached and keyed only on the include_mbbs bool -
-    NOT on the underlying DataFrame - so flipping the year/field dropdowns
-    elsewhere on the page never re-triggers this."""
+def compute_field_df() -> pd.DataFrame:
+    """Genuine-specialty rows only (Primary_Specialty/Specialty_Year) - this
+    is used for every "Leading Field" style chart on this page. MBBS/BDS is
+    deliberately NEVER included here (see module docstring) - it has its own
+    separate section (compute_base_degree_by_year below) instead."""
     df = load_and_enrich()
-    field_col = "Field_All" if include_mbbs else "Primary_Specialty"
-    year_col = "Field_All_Year" if include_mbbs else "Specialty_Year"
-    field_base_df = df if include_mbbs else df[df["Is_Specialist"]]
-    return field_base_df[field_base_df[year_col].between(MIN_YEAR, MAX_YEAR) & field_base_df[field_col].notna()]
+    specialists = df[df["Is_Specialist"]]
+    return specialists[specialists["Specialty_Year"].between(MIN_YEAR, MAX_YEAR) & specialists["Primary_Specialty"].notna()]
 
 
 @st.cache_data(ttl=3600)
@@ -113,34 +122,54 @@ def compute_yearly_registration_counts() -> pd.Series:
 
 
 @st.cache_data(ttl=3600)
-def compute_top_field_per_year(include_mbbs: bool) -> pd.DataFrame:
-    """Which field led each year - independent of any live selection, so this
-    is cached separately from the per-year/per-field drill-down sections."""
-    field_col = "Field_All" if include_mbbs else "Primary_Specialty"
-    year_col = "Field_All_Year" if include_mbbs else "Specialty_Year"
-    field_df = compute_field_df(include_mbbs)
+def compute_base_degree_by_year() -> pd.DataFrame:
+    """MBBS vs BDS split, per year - kept entirely separate from the
+    specialty "Leading Field" charts (see module docstring). Uses
+    Base_Degree_Year (the year each doctor's FIRST/base qualification was
+    passed), which is the natural year axis for "how many MBBS vs BDS
+    graduates that year" - not RegYear (when they registered with PMDC,
+    which can lag years behind graduation) and not Specialty_Year (which
+    only exists for the subset who went on to specialize)."""
+    df = load_and_enrich()
+    base_df = df[df["Base_Degree_Year"].between(MIN_YEAR, MAX_YEAR) & df["Base_Degree"].isin(["MBBS", "BDS"])]
+    tab = base_df.groupby(["Base_Degree_Year", "Base_Degree"]).size().unstack(fill_value=0)
+    tab.index = tab.index.astype(int)
+    for col in ("MBBS", "BDS"):
+        if col not in tab.columns:
+            tab[col] = 0
+    tab["Total"] = tab["MBBS"] + tab["BDS"]
+    tab["MBBS_%"] = (tab["MBBS"] / tab["Total"] * 100).round(1)
+    tab["BDS_%"] = (tab["BDS"] / tab["Total"] * 100).round(1)
+    return tab
+
+
+@st.cache_data(ttl=3600)
+def compute_top_field_per_year() -> pd.DataFrame:
+    """Which specialty led each year - independent of any live selection, so
+    this is cached separately from the per-year/per-field drill-down
+    sections."""
+    field_df = compute_field_df()
     top_field_per_year = (
-        field_df.groupby([year_col, field_col]).size()
+        field_df.groupby(["Specialty_Year", "Primary_Specialty"]).size()
         .reset_index(name="Count")
-        .sort_values([year_col, "Count"], ascending=[True, False])
-        .groupby(year_col).first()
+        .sort_values(["Specialty_Year", "Count"], ascending=[True, False])
+        .groupby("Specialty_Year").first()
         .reset_index()
     )
-    top_field_per_year[year_col] = top_field_per_year[year_col].astype(int)
+    top_field_per_year["Specialty_Year"] = top_field_per_year["Specialty_Year"].astype(int)
     top_field_per_year.columns = ["Year", "Leading Field", "Doctors"]
     return top_field_per_year
 
 
 @st.cache_data(ttl=3600)
-def compute_field_heatmap(include_mbbs: bool) -> pd.DataFrame:
-    """Top-10-fields-by-year matrix for the heatmap - independent of any live
-    selection, cached separately so it's computed once, not on every click."""
-    field_col = "Field_All" if include_mbbs else "Primary_Specialty"
-    year_col = "Field_All_Year" if include_mbbs else "Specialty_Year"
-    field_df = compute_field_df(include_mbbs)
-    top_fields_overall = field_df[field_col].value_counts().head(10).index.tolist()
-    heat_src = field_df[field_df[field_col].isin(top_fields_overall)]
-    heat_tab = heat_src.groupby([year_col, field_col]).size().unstack(fill_value=0)
+def compute_field_heatmap() -> pd.DataFrame:
+    """Top-10-specialties-by-year matrix for the heatmap - independent of any
+    live selection, cached separately so it's computed once, not on every
+    click."""
+    field_df = compute_field_df()
+    top_fields_overall = field_df["Primary_Specialty"].value_counts().head(10).index.tolist()
+    heat_src = field_df[field_df["Primary_Specialty"].isin(top_fields_overall)]
+    heat_tab = heat_src.groupby(["Specialty_Year", "Primary_Specialty"]).size().unstack(fill_value=0)
     heat_tab.index = heat_tab.index.astype(int)
     return heat_tab
 
@@ -158,15 +187,12 @@ def render_yearly_deep_dive():
         st.error("❌ No records returned. Check that data/doctors_combined_full_all_qualifications.csv is present.")
         return
 
-    include_mbbs = st.checkbox(
-        "Include MBBS/BDS as a field in the charts below (recommended — otherwise you only see specialists)",
-        value=True, key="include_mbbs_toggle"
-    )
-    field_col = "Field_All" if include_mbbs else "Primary_Specialty"
-    year_col = "Field_All_Year" if include_mbbs else "Specialty_Year"
+    field_col = "Primary_Specialty"
+    year_col = "Specialty_Year"
+    field_label = "Specialty Field"
 
     reg_df = df[df["RegYear"].between(MIN_YEAR, MAX_YEAR)]
-    field_df = compute_field_df(include_mbbs)
+    field_df = compute_field_df()
 
     # ------------------------------------------------------------------
     # Top KPIs
@@ -193,18 +219,41 @@ def render_yearly_deep_dive():
     st.dataframe(yearly_tab.sort_values("Year", ascending=False), use_container_width=True, hide_index=True, height=300)
 
     # ------------------------------------------------------------------
-    # Section 2: Which field led each year (MBBS/BDS included if toggled on)
+    # Section 1b: Base Degree (MBBS vs BDS) - kept SEPARATE from the
+    # specialty "Leading Field" sections below on purpose (see module
+    # docstring). This is the base degree nearly every doctor holds, not a
+    # specialization, so it never appears mixed into a specialty ranking.
     # ------------------------------------------------------------------
-    field_label = "Field (incl. MBBS/BDS)" if include_mbbs else "Specialty Field"
+    st.markdown("### Base Degree Split (MBBS vs BDS), Every Year")
+    st.caption("Shown separately from the Specialty Field sections below - MBBS/BDS is the base degree "
+               "nearly every doctor holds, not a specialization, so it's never mixed into those rankings.")
+    base_deg_tab = compute_base_degree_by_year()
+    if not base_deg_tab.empty:
+        base_deg_long = base_deg_tab.reset_index().melt(
+            id_vars="Base_Degree_Year", value_vars=["MBBS", "BDS"], var_name="Degree", value_name="Doctors"
+        ).rename(columns={"Base_Degree_Year": "Year"})
+        render_premium_chart(px.bar, base_deg_long, x="Year", y="Doctors", color="Degree", barmode="stack",
+                              title=f"MBBS vs BDS, By Year (through {MAX_YEAR})",
+                              color_discrete_sequence=["#2A9D8F", "#E8C547"])
+        st.dataframe(
+            base_deg_tab[["MBBS", "BDS", "Total", "MBBS_%", "BDS_%"]].sort_index(ascending=False),
+            use_container_width=True, height=300
+        )
+    else:
+        st.info("Not enough dated base-degree records to build this chart.")
+
+    # ------------------------------------------------------------------
+    # Section 2: Which specialty field led each year
+    # ------------------------------------------------------------------
     st.markdown(f"### Top {field_label}, Every Year")
-    top_field_per_year = compute_top_field_per_year(include_mbbs)
+    top_field_per_year = compute_top_field_per_year()
     render_premium_chart(px.bar, top_field_per_year, x="Year", y="Doctors", color="Leading Field",
                           title=f"Doctors in That Year's Leading {field_label}",
                           chart_height=440)
     st.dataframe(top_field_per_year.sort_values("Year", ascending=False), use_container_width=True, hide_index=True, height=320)
 
     st.markdown(f"#### {field_label} Popularity Heatmap — Top 10 Across the Years")
-    heat_tab = compute_field_heatmap(include_mbbs)
+    heat_tab = compute_field_heatmap()
     if not heat_tab.empty:
         render_premium_chart(px.imshow, heat_tab.T, aspect="auto", color_continuous_scale="YlGnBu",
                               labels=dict(x="Year", y="Field", color="Doctors"),

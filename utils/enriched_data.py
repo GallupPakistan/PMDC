@@ -47,7 +47,14 @@ from utils.gender_province import (
 logger = logging.getLogger(__name__)
 
 SPEC_COLS = [f"Qualification_{i}_Speciality" for i in range(1, 8)]
-_NON_SPECIALTY_VALUES = {"", ".", "BASIC MEDICAL QUALIFICATION", "NAN"}
+# Generic "this is just your base degree" markers - NOT real specializations.
+# BUG FIX: only "BASIC MEDICAL QUALIFICATION" (MBBS's generic marker) was
+# excluded here; "BASIC DENTAL QUALIFICATION" (the exact same kind of
+# generic marker, just for BDS) was missing. That meant ~26,238 dentists
+# whose only qualification is a base BDS degree were wrongly counted as
+# "Is_Specialist" and their BDS showed up as a bar on the "Specialization
+# Degree Types" chart - BDS is a base degree, not a specialization.
+_NON_SPECIALTY_VALUES = {"", ".", "BASIC MEDICAL QUALIFICATION", "BASIC DENTAL QUALIFICATION", "NAN"}
 
 BASE_DEGREE_MAP = {
     "mbbs": "MBBS", "bds": "BDS",

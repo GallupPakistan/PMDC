@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import traceback
+import re
+from datetime import datetime
 
 from utils.gender_province import (
     infer_gender_series,
@@ -34,7 +36,33 @@ def render_premium_chart(chart_func, *args, chart_height=340, **kwargs):
         )
         fig.update_xaxes(showgrid=False, zeroline=False, title_font=dict(color="#374151", size=10))
         fig.update_yaxes(gridcolor="rgba(0,0,0,0.08)", zeroline=False, title_font=dict(color="#374151", size=10))
-        
+
+        # Force x-axis ticks to reach the actual max data year for year-based
+        # charts (same fix applied dashboard-wide on Overview and Gender &
+        # Specialization): Plotly's auto-tick sometimes stops short of the
+        # real max year (e.g. ticks only to 2015 when data goes to 2018),
+        # silently hiding the tail end of the line/bars. Detected generically
+        # (any x values that look like calendar years).
+        x_values = []
+        for trace in fig.data:
+            xs = getattr(trace, "x", None)
+            if xs is None:
+                continue
+            x_values.extend(v for v in xs if isinstance(v, (int, float)) and not pd.isna(v))
+        if x_values and 1900 <= min(x_values) and max(x_values) <= 2100:
+            year_min, year_max = int(min(x_values)), int(max(x_values))
+            tick_vals = list(range((year_min // 5) * 5, year_max + 1, 5))
+            if tick_vals[-1] != year_max:
+                tick_vals.append(year_max)
+            fig.update_xaxes(tickmode="array", tickvals=tick_vals)
+
+        # Data labels on by default: pies get percent+label automatically.
+        # Bar charts get their % text set explicitly at each call site
+        # instead, since each needs its own denominator.
+        trace_types = {trace.type for trace in fig.data}
+        if "pie" in trace_types:
+            fig.update_traces(textinfo="percent+label", textposition="inside", selector=dict(type="pie"))
+
         st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
     except Exception as e:
         st.warning(f"⚠️ Render skip on this element.")
@@ -94,18 +122,63 @@ def load_and_normalize_doctor_analytics():
     return _normalize_analytics_data(raw_df.copy())
 
 
+def _normalize_degree_token(degree):
+    """Collapse punctuation variants of the same base degree (e.g.
+    "M.B.,B.S." and "MBBS") into one canonical name. Same fix as the
+    Overview page's normalize_degree_name(): stripping only spaces and dots
+    left a stray comma in "M.B.,B.S." (-> "MB,BS"), which broke the "MBBS"
+    substring match and let it survive as its own separate degree category."""
+    if pd.isna(degree) or str(degree).strip() in ("", "N/A"):
+        return None
+    cleaned = str(degree).strip().upper().replace(" ", "").replace(".", "").replace(",", "")
+    if "MBBS" in cleaned:
+        return "MBBS"
+    if "BDS" in cleaned:
+        return "BDS"
+    return str(degree).strip()
+
+
+def _qual_year(qual):
+    try:
+        return int(qual.get("PassingYear"))
+    except (TypeError, ValueError):
+        return 9999
+
+
+def _base_qualification(quals):
+    """Pick the doctor's foundational (MBBS/BDS) qualification out of their
+    full Qualifications list, rather than blindly taking array position 0.
+    Real PMDC records aren't always stored chronologically - e.g. a
+    postgraduate FCPS entry can appear before the doctor's actual MBBS - so
+    "qs[0]" alone can misidentify a specialist's base degree as their
+    postgraduate one. Same fix as the Overview page's
+    get_base_qualification()."""
+    if not isinstance(quals, list) or len(quals) == 0:
+        return None
+    base_candidates = [q for q in quals if isinstance(q, dict) and _normalize_degree_token(q.get("Degree")) in ("MBBS", "BDS")]
+    if base_candidates:
+        return min(base_candidates, key=_qual_year)
+    dated = [q for q in quals if isinstance(q, dict) and q.get("PassingYear") not in (None, "")]
+    if dated:
+        return min(dated, key=_qual_year)
+    return quals[0] if isinstance(quals[0], dict) else None
+
+
 def _normalize_analytics_data(df):
     # The real DB stores qualifications as a nested list under "Qualifications"
     # (each entry a dict with Degree/University/Speciality/PassingYear keys) -
     # same shape used on the Qualification Analytics / University Insights pages.
-    # Extract the primary (first) qualification into flat columns here so the
-    # rest of this page's logic (which expects flat Qualification_1_* columns)
-    # actually finds real data instead of falling through to "Unknown".
+    # Extract the doctor's BASE qualification (see _base_qualification above)
+    # into flat columns here so the rest of this page's logic (which expects
+    # flat Qualification_1_* columns) actually finds real, correctly-picked
+    # data instead of falling through to "Unknown" or picking a postgraduate
+    # entry by mistake.
     def extract_qual_field(quals, key):
-        if isinstance(quals, list) and len(quals) > 0 and isinstance(quals[0], dict):
-            val = quals[0].get(key)
-            return val if val not in (None, "") else None
-        return None
+        base = _base_qualification(quals)
+        if base is None:
+            return None
+        val = base.get(key)
+        return val if val not in (None, "") else None
 
     if "Qualifications" in df.columns:
         if "Qualification_1_Degree" not in df.columns:
@@ -151,13 +224,26 @@ def _normalize_analytics_data(df):
     df.loc[df["Province"].astype(str).str.strip().isin(["", "Unknown", "N/A", "nan"]), "Province"] = inferred_province
 
     # Clean compliance flags
+    #
+    # BUG FIX: the previous version of this function checked `"ACTIVE" in raw`
+    # as its last rule, with no earlier check for "IN-ACTIVE". Since the
+    # string "IN-ACTIVE" literally CONTAINS "ACTIVE" as a substring, every
+    # inactive doctor (106,138 of them - 41% of the whole registry) was being
+    # counted as "Active" here. This inflated this page's "Active" KPI/charts
+    # to ~99.5% Active, when the real figure (confirmed against the same
+    # regex-based approach already used correctly on the Status & License and
+    # Doctor Search pages) is ~58.4%. Fixed by checking for "in-active" /
+    # "inactive" FIRST, and only matching an EXACT "active" (not a substring)
+    # for the Active bucket.
     def clean_pmdc_status(val):
-        raw = str(val).upper()
-        if any(x in raw for x in ["CANCEL", "REMOVED", "DE-REG"]): return "Cancelled"
-        if any(x in raw for x in ["SUSPEND", "HOLD", "BLOCK"]): return "Suspended"
-        if "EXPIRE" in raw: return "Expired"
-        if "PROVISIONAL" in raw: return "Provisional"
-        if "ACTIVE" in raw: return "Active"
+        raw = str(val).strip()
+        if re.search(r"in[\s\-]?active", raw, re.I):
+            return "In-Active"
+        raw_upper = raw.upper()
+        if any(x in raw_upper for x in ["CANCEL", "REMOVED", "DE-REG"]): return "Cancelled"
+        if any(x in raw_upper for x in ["SUSPEND", "HOLD", "BLOCK"]): return "Suspended"
+        if "EXPIRE" in raw_upper: return "Expired"
+        if re.fullmatch(r"active", raw, re.I): return "Active"
         return "Unknown"
 
     df["Status_Clean"] = df["Status"].apply(clean_pmdc_status)
@@ -182,12 +268,31 @@ def _normalize_analytics_data(df):
     else:
         df["RegYear"] = float("nan")
 
-    df["ExperienceYears"] = 2026 - df["RegYear"]
+    # Was hardcoded to a fixed year (2026) - would silently become wrong every
+    # year after that. Uses today's actual year instead.
+    df["ExperienceYears"] = datetime.now().year - df["RegYear"]
 
     # Final string cleaning for charts
     df["RegType_Clean"] = df["RegistrationType"].astype(str).str.title().apply(lambda x: safe_truncate(x, 15))
-    df["Speciality_Clean"] = df["Qualification_1_Speciality"].astype(str).fillna("N/A")
-    df["Degree_Clean"] = df["Qualification_1_Degree"].astype(str).fillna("N/A")
+    # BUG FIX: "BASIC MEDICAL QUALIFICATION" / "BASIC DENTAL QUALIFICATION"
+    # are generic placeholder Speciality values PMDC uses for a doctor's base
+    # MBBS/BDS entry - not real specialties - but this column showed them raw,
+    # so they appeared as if they were "specialties" on this page's charts
+    # (same bug already fixed in utils/enriched_data.py for the rest of the
+    # dashboard; this page has its own separate extraction so it needed the
+    # same fix applied here too).
+    _NON_SPECIALTY_VALUES = {"", ".", "N/A", "NAN", "BASIC MEDICAL QUALIFICATION", "BASIC DENTAL QUALIFICATION"}
+    _speciality_raw = df["Qualification_1_Speciality"].astype(str).fillna("N/A")
+    # Mapped to "Unknown" (not "N/A") specifically so exclude_unknown() -
+    # used everywhere this column feeds a chart - actually drops them,
+    # instead of them surviving as their own "N/A" bar.
+    df["Speciality_Clean"] = _speciality_raw.where(~_speciality_raw.str.strip().str.upper().isin(_NON_SPECIALTY_VALUES), "Unknown")
+    # .apply(_normalize_degree_token) merges punctuation variants like
+    # "M.B.,B.S." into "MBBS" so they don't split into separate bars on the
+    # degree-distribution and seniority charts below.
+    df["Degree_Clean"] = df["Qualification_1_Degree"].apply(
+        lambda d: _normalize_degree_token(d) or "N/A"
+    )
     df["Univ_Clean"] = df["Qualification_1_University"].astype(str).fillna("N/A")
     df["Province_Clean"] = df["Province"].astype(str).fillna("N/A")
     df["City_Clean"] = df["City"].astype(str).fillna("N/A")
@@ -310,13 +415,17 @@ def render_doctor_analytics():
 
             r3c1, r3c2 = st.columns(2)
             with r3c1:
-                g_track = exclude_unknown(df, "RegType_Clean", "Gender_Clean").groupby(["RegType_Clean", "Gender_Clean"]).size().reset_index(name="Count")
-                render_premium_chart(px.bar, g_track, x="RegType_Clean", y="Count", color="Gender_Clean", barmode="group", title="5. Gender Representation by License Model", color_discrete_sequence=["#2A9D8F", "#E8C547"])
+                g_track_pool = exclude_unknown(df, "RegType_Clean", "Gender_Clean")
+                g_track = g_track_pool.groupby(["RegType_Clean", "Gender_Clean"]).size().reset_index(name="Count")
+                g_track["Pct"] = (g_track["Count"] / len(g_track_pool) * 100).round(1)
+                render_premium_chart(px.bar, g_track, x="RegType_Clean", y="Count", color="Gender_Clean", barmode="group", title="5. Gender Representation by License Model", color_discrete_sequence=["#2A9D8F", "#E8C547"], text=g_track["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Gender distribution across administrative license parameters. <em>Gender inferred from first name where not explicitly provided — treat as approximate.</em></p>", unsafe_allow_html=True)
             with r3c2:
-                sp_data = exclude_unknown(df, "Speciality_Clean")["Speciality_Clean"].value_counts().reset_index().head(5)
+                sp_pool = exclude_unknown(df, "Speciality_Clean")
+                sp_data = sp_pool["Speciality_Clean"].value_counts().reset_index().head(5)
                 sp_data.columns = ["Speciality", "Count"]
-                render_premium_chart(px.bar, sp_data, x="Count", y="Speciality", orientation="h", title="6. Primary Specialized Domains Leadership", color_discrete_sequence=["#C9A84C"])
+                sp_data["Pct"] = (sp_data["Count"] / len(sp_pool) * 100).round(1)
+                render_premium_chart(px.bar, sp_data, x="Count", y="Speciality", orientation="h", title="6. Primary Specialized Domains Leadership", color_discrete_sequence=["#C9A84C"], text=sp_data["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Personnel capacity alignment mapping the top 5 clinical categories.</p>", unsafe_allow_html=True)
 
             r4c1, r4c2 = st.columns(2)
@@ -324,7 +433,8 @@ def render_doctor_analytics():
                 df["Seniority_Group"] = pd.cut(df["ExperienceYears"], bins=[-1, 5, 15, 30, 120], labels=["Junior (<5Y)", "Mid-Career", "Senior", "Veteran (30Y+)"])
                 sg_data = df["Seniority_Group"].value_counts().reset_index()
                 sg_data.columns = ["Segment", "Count"]
-                render_premium_chart(px.bar, sg_data, x="Segment", y="Count", title="7. Structural Seniority Tier Breakdowns", color_discrete_sequence=["#E8C547"])
+                sg_data["Pct"] = (sg_data["Count"] / len(df) * 100).round(1)
+                render_premium_chart(px.bar, sg_data, x="Segment", y="Count", title="7. Structural Seniority Tier Breakdowns", color_discrete_sequence=["#E8C547"], text=sg_data["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Workforce segmentation sorted by professional maturity levels.</p>", unsafe_allow_html=True)
             with r4c2:
                 violin_df = exclude_unknown(df, "Status_Clean")
@@ -336,11 +446,14 @@ def render_doctor_analytics():
                 spec_known = exclude_unknown(df, "Speciality_Clean", "Gender_Clean")
                 g_spec = spec_known[spec_known["Speciality_Clean"].isin(spec_known["Speciality_Clean"].value_counts().head(4).index)]
                 g_spec = g_spec.groupby(["Speciality_Clean", "Gender_Clean"]).size().reset_index(name="Count")
-                render_premium_chart(px.bar, g_spec, x="Speciality_Clean", y="Count", color="Gender_Clean", barmode="stack", title="9. Gender Dispersal in Core Fields", color_discrete_sequence=["#C9A84C", "#457B9D"])
+                g_spec["Pct"] = (g_spec["Count"] / len(spec_known) * 100).round(1)
+                render_premium_chart(px.bar, g_spec, x="Speciality_Clean", y="Count", color="Gender_Clean", barmode="stack", title="9. Gender Dispersal in Core Fields", color_discrete_sequence=["#C9A84C", "#457B9D"], text=g_spec["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Stacked volume distribution of male vs female counts across primary domains. <em>Gender inferred from first name where not explicitly provided — treat as approximate.</em></p>", unsafe_allow_html=True)
             with r5c2:
-                track_status = exclude_unknown(df, "RegType_Clean", "Status_Clean").groupby(["RegType_Clean", "Status_Clean"]).size().reset_index(name="Count")
-                render_premium_chart(px.bar, track_status, x="RegType_Clean", y="Count", color="Status_Clean", barmode="stack", title="10. Compliance Status Breakdown by Track", color_discrete_sequence=["#2A9D8F", "#E8C547", "#EF4444"])
+                track_status_pool = exclude_unknown(df, "RegType_Clean", "Status_Clean")
+                track_status = track_status_pool.groupby(["RegType_Clean", "Status_Clean"]).size().reset_index(name="Count")
+                track_status["Pct"] = (track_status["Count"] / len(track_status_pool) * 100).round(1)
+                render_premium_chart(px.bar, track_status, x="RegType_Clean", y="Count", color="Status_Clean", barmode="stack", title="10. Compliance Status Breakdown by Track", color_discrete_sequence=["#2A9D8F", "#E8C547", "#EF4444"], text=track_status["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Hierarchical compliance mapping nested directly within license types.</p>", unsafe_allow_html=True)
 
         # ────────────────────────────────────────────────────────────────────────
@@ -373,17 +486,20 @@ def render_doctor_analytics():
                         others_sum = un_data.iloc[10:]["Count"].sum()
                         un_data = pd.concat([top_part, pd.DataFrame([{"University": "Others", "Count": others_sum}])], ignore_index=True)
                     un_data = un_data.sort_values("Count", ascending=True)
+                    un_data["Pct"] = (un_data["Count"] / un_data["Count"].sum() * 100).round(1)
                     render_premium_chart(px.bar, un_data, x="Count", y="University", orientation="h",
                                          title="3. Top 10 Universities — Educational Leaderboard",
-                                         color_discrete_sequence=["#C9A84C"])
+                                         color_discrete_sequence=["#C9A84C"], text=un_data["Pct"].map(lambda p: f"{p}%"))
                     st.markdown("<p class='insight-text'>Top 10 universities by workforce volume — switch to Table above to see every university.</p>", unsafe_allow_html=True)
                 else:
                     st.dataframe(un_data_full.sort_values("Count", ascending=False), use_container_width=True, hide_index=True, height=340)
                     st.markdown("<p class='insight-text'>Every university in the current filter selection, sorted by doctor count.</p>", unsafe_allow_html=True)
             with r7c2:
-                dg_data = exclude_unknown(df, "Degree_Clean")["Degree_Clean"].value_counts().reset_index().head(5)
+                dg_pool = exclude_unknown(df, "Degree_Clean")
+                dg_data = dg_pool["Degree_Clean"].value_counts().reset_index().head(5)
                 dg_data.columns = ["Degree", "Count"]
-                render_premium_chart(px.bar, dg_data, x="Degree", y="Count", title="4. Primary Credentials Tiers Breakdown", color_discrete_sequence=["#E8C547"])
+                dg_data["Pct"] = (dg_data["Count"] / len(dg_pool) * 100).round(1)
+                render_premium_chart(px.bar, dg_data, x="Degree", y="Count", title="4. Primary Credentials Tiers Breakdown", color_discrete_sequence=["#E8C547"], text=dg_data["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Distribution of initial qualification titles across total active records.</p>", unsafe_allow_html=True)
 
             r8c1, r8c2 = st.columns(2)
@@ -391,27 +507,31 @@ def render_doctor_analytics():
                 # Shows every KNOWN province (not a subset) - simple sorted bar reads
                 # clearer to a non-technical audience than a funnel shape. Rows with
                 # no identifiable province are excluded rather than shown as "Unknown".
-                pr_data = exclude_unknown(df, "Province_Clean")["Province_Clean"].value_counts().reset_index()
+                pr_pool = exclude_unknown(df, "Province_Clean")
+                pr_data = pr_pool["Province_Clean"].value_counts().reset_index()
                 pr_data.columns = ["Province", "Count"]
                 pr_data = pr_data.sort_values("Count", ascending=True)
+                pr_data["Pct"] = (pr_data["Count"] / len(pr_pool) * 100).round(1)
                 render_premium_chart(px.bar, pr_data, x="Count", y="Province", orientation="h",
                                      title="5. Full Provincial Share of Registered Doctors",
-                                     color_discrete_sequence=["#2A9D8F"], text="Count")
+                                     color_discrete_sequence=["#2A9D8F"], text=pr_data["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Every identifiable province is shown here — AJK is ground-truth (from its own registry series); other provinces are inferred from the doctor's primary university.</p>", unsafe_allow_html=True)
             with r8c2:
                 # Shows every known district/city, not just a top-N slice. Height grows
                 # with the number of districts so labels never overlap. Rows with no
                 # identifiable district are excluded rather than shown as "Unknown".
-                ct_data = exclude_unknown(df, "City_Clean")["City_Clean"].value_counts().reset_index()
+                ct_pool = exclude_unknown(df, "City_Clean")
+                ct_data = ct_pool["City_Clean"].value_counts().reset_index()
                 ct_data.columns = ["City", "Count"]
                 if ct_data.empty:
                     st.info("ℹ️ No District/City data is available in the current registry export — this field appears to not be tracked in the source data.")
                 else:
                     ct_data = ct_data.sort_values("Count", ascending=True)
+                    ct_data["Pct"] = (ct_data["Count"] / len(ct_pool) * 100).round(1)
                     city_chart_height = max(340, 24 * len(ct_data))
                     render_premium_chart(px.bar, ct_data, x="Count", y="City", orientation="h",
                                          title="6. All Districts — Doctor Sourcing Concentration",
-                                         color_discrete_sequence=["#E8C547"], text="Count",
+                                         color_discrete_sequence=["#E8C547"], text=ct_data["Pct"].map(lambda p: f"{p}%"),
                                          chart_height=city_chart_height)
                     st.markdown("<p class='insight-text'>Every identifiable district/city in the registry is listed here, sorted by doctor count.</p>", unsafe_allow_html=True)
 
@@ -438,23 +558,36 @@ def render_doctor_analytics():
                 )
                 fig_prov.update_xaxes(showgrid=False, zeroline=False)
                 fig_prov.update_yaxes(gridcolor="rgba(0,0,0,0.08)", zeroline=False)
+                # Same year-tick fix as render_premium_chart (this chart is
+                # built manually, not through that wrapper, so it needs it
+                # applied directly).
+                prov_x = [v for v in reg_v["RegYear"] if isinstance(v, (int, float)) and not pd.isna(v)]
+                if prov_x:
+                    py_min, py_max = int(min(prov_x)), int(max(prov_x))
+                    prov_ticks = list(range((py_min // 5) * 5, py_max + 1, 5))
+                    if prov_ticks[-1] != py_max:
+                        prov_ticks.append(py_max)
+                    fig_prov.update_xaxes(tickmode="array", tickvals=prov_ticks)
                 st.plotly_chart(fig_prov, use_container_width=True, config={'displayModeBar': False})
                 st.markdown("<p class='insight-text'>Shows what each identifiable province's registration volume looked like in every year on record.</p>", unsafe_allow_html=True)
             with r9c2:
-                un_mix = exclude_unknown(df, "Univ_Clean", "RegType_Clean")
-                un_mix = un_mix[un_mix["Univ_Clean"].isin(un_mix["Univ_Clean"].value_counts().head(3).index)]
-                un_mix = un_mix.groupby(["Univ_Clean", "RegType_Clean"]).size().reset_index(name="Count")
-                render_premium_chart(px.bar, un_mix, x="Univ_Clean", y="Count", color="RegType_Clean", barmode="stack", title="8. Academic Output vs License Track", color_discrete_sequence=["#C9A84C", "#2A9D8F"])
+                un_mix_pool = exclude_unknown(df, "Univ_Clean", "RegType_Clean")
+                un_mix_pool = un_mix_pool[un_mix_pool["Univ_Clean"].isin(un_mix_pool["Univ_Clean"].value_counts().head(3).index)]
+                un_mix = un_mix_pool.groupby(["Univ_Clean", "RegType_Clean"]).size().reset_index(name="Count")
+                un_mix["Pct"] = (un_mix["Count"] / len(un_mix_pool) * 100).round(1)
+                render_premium_chart(px.bar, un_mix, x="Univ_Clean", y="Count", color="RegType_Clean", barmode="stack", title="8. Academic Output vs License Track", color_discrete_sequence=["#C9A84C", "#2A9D8F"], text=un_mix["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Stacked comparison mapping institutional output to practice parameters.</p>", unsafe_allow_html=True)
 
             r10c1, r10c2 = st.columns(2)
             with r10c1:
                 deg_exp = exclude_unknown(df, "Degree_Clean").groupby("Degree_Clean")["ExperienceYears"].mean().reset_index(name="AvgExp").sort_values(by="AvgExp", ascending=False).head(5)
-                render_premium_chart(px.bar, deg_exp, x="Degree_Clean", y="AvgExp", title="9. Seniority Index Across Core Degrees", color_discrete_sequence=["#2A9D8F"])
+                render_premium_chart(px.bar, deg_exp, x="Degree_Clean", y="AvgExp", title="9. Seniority Index Across Core Degrees", color_discrete_sequence=["#2A9D8F"], text=deg_exp["AvgExp"].map(lambda v: f"{v:.1f}y"))
                 st.markdown("<p class='insight-text'>Average practitioner practice years mapped across primary initial degrees.</p>", unsafe_allow_html=True)
             with r10c2:
-                matrix = exclude_unknown(df, "Province_Clean", "RegType_Clean").groupby(["Province_Clean", "RegType_Clean"]).size().reset_index(name="Count")
-                render_premium_chart(px.bar, matrix, x="Province_Clean", y="Count", color="RegType_Clean", barmode="group", title="10. Regional Workforce Layout Grid", color_discrete_sequence=["#E8C547", "#C9A84C"])
+                matrix_pool = exclude_unknown(df, "Province_Clean", "RegType_Clean")
+                matrix = matrix_pool.groupby(["Province_Clean", "RegType_Clean"]).size().reset_index(name="Count")
+                matrix["Pct"] = (matrix["Count"] / len(matrix_pool) * 100).round(1)
+                render_premium_chart(px.bar, matrix, x="Province_Clean", y="Count", color="RegType_Clean", barmode="group", title="10. Regional Workforce Layout Grid", color_discrete_sequence=["#E8C547", "#C9A84C"], text=matrix["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Comparative workforce spread mapping track distributions across all provinces.</p>", unsafe_allow_html=True)
 
             # ────────────────────────────────────────────────────────────
@@ -465,10 +598,12 @@ def render_doctor_analytics():
 
             r11c1, r11c2 = st.columns(2)
             with r11c1:
-                prov_gender = exclude_unknown(df, "Province_Clean", "Gender_Clean").groupby(["Province_Clean", "Gender_Clean"]).size().reset_index(name="Count")
+                prov_gender_pool = exclude_unknown(df, "Province_Clean", "Gender_Clean")
+                prov_gender = prov_gender_pool.groupby(["Province_Clean", "Gender_Clean"]).size().reset_index(name="Count")
+                prov_gender["Pct"] = (prov_gender["Count"] / len(prov_gender_pool) * 100).round(1)
                 render_premium_chart(px.bar, prov_gender, x="Province_Clean", y="Count", color="Gender_Clean",
                                      barmode="group", title="11. Male vs Female Doctors — Every Province",
-                                     color_discrete_sequence=["#2A9D8F", "#E8C547"])
+                                     color_discrete_sequence=["#2A9D8F", "#E8C547"], text=prov_gender["Pct"].map(lambda p: f"{p}%"))
                 st.markdown("<p class='insight-text'>Side-by-side male and female doctor counts for every identifiable province.</p>", unsafe_allow_html=True)
             with r11c2:
                 city_gender = exclude_unknown(df, "City_Clean", "Gender_Clean").groupby(["City_Clean", "Gender_Clean"]).size().reset_index(name="Count")

@@ -40,9 +40,26 @@ def normalize_reg_type(raw: str) -> str:
 
 
 def get_first_qual_field(quals, key):
-    if isinstance(quals, list) and len(quals) > 0 and isinstance(quals[0], dict):
-        return quals[0].get(key)
-    return None
+    """Return the doctor's BASE (MBBS/BDS) qualification's field, not just
+    array position 0 - matches the same fix applied dashboard-wide (real
+    records aren't always chronologically ordered, so quals[0] can be a
+    postgraduate entry instead of the doctor's actual base degree/university,
+    which would show wrong "Primary Degree"/"Primary University" in search
+    results)."""
+    def _year(q):
+        try:
+            return int(q.get("PassingYear"))
+        except (TypeError, ValueError):
+            return 9999
+    if not (isinstance(quals, list) and len(quals) > 0):
+        return None
+    base_candidates = [q for q in quals if isinstance(q, dict) and canonicalize_degree(q.get("Degree")) in ("MBBS", "BDS")]
+    if base_candidates:
+        base = min(base_candidates, key=_year)
+    else:
+        dated = [q for q in quals if isinstance(q, dict) and q.get("PassingYear") not in (None, "")]
+        base = min(dated, key=_year) if dated else (quals[0] if isinstance(quals[0], dict) else None)
+    return base.get(key) if base else None
 
 
 DEGREE_CANONICAL_MAP = {
@@ -346,7 +363,7 @@ def render_doctor_search():
             st.plotly_chart(fig4, use_container_width=True)
 
         timeline = filtered_df.dropna(subset=["RegYear"]).groupby("RegYear").size().reset_index(name="Count")
-        timeline = timeline[timeline["RegYear"].between(1950, 2026)]
+        timeline = timeline[timeline["RegYear"].between(1950, 2018)]
         fig5 = px.area(timeline, x="RegYear", y="Count", title="Cohort Registration Timeline",
                        color_discrete_sequence=["#2A9D8F"])
         fig5.update_layout(**layout_theme)
@@ -400,7 +417,7 @@ def render_doctor_search():
 
         with r4c2:
             hist_df = filtered_df.dropna(subset=["RegYear"])
-            hist_df = hist_df[hist_df["RegYear"].between(1950, 2026)]
+            hist_df = hist_df[hist_df["RegYear"].between(1950, 2018)]
             hist_df = hist_df[hist_df["Gender"] != "Unknown"]
             fig10 = px.histogram(hist_df, x="RegYear", color="Gender", nbins=20, title="Experience by Gender (Inferred)",
                                 barmode="group", color_discrete_sequence=["#B8860B", "#2A9D8F", "#94A3B8"])

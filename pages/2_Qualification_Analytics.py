@@ -4,6 +4,7 @@ import traceback
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from datetime import datetime
 import streamlit as st
 
 from utils.gender_province import (
@@ -74,6 +75,25 @@ def exclude_unknown(data: pd.DataFrame, *cols) -> pd.DataFrame:
     return data[mask]
 
 
+# Buckets messy, free-text Status values (100+ distinct raw strings in the
+# real data, e.g. "Cancelled Permanently w.e.f 14th Feb 2022", "DC-Action:
+# 1145", "Suspended Till Appearance") down to a handful of clean categories.
+# Without this, any chart grouped by raw "Status" ends up with a legend of
+# dozens of near-duplicate entries - unreadable and overlapping.
+# "in-active"/"inactive" are checked BEFORE "active" since "in-active"
+# contains "active" as a substring (same class of bug fixed dashboard-wide).
+STATUS_BUCKET_MAP = {"in-active": "In-Active", "inactive": "In-Active", "active": "Active", "suspended": "Suspended", "cancelled": "Cancelled", "cancel": "Cancelled"}
+
+def bucket_status(s):
+    if not isinstance(s, str):
+        return "Other"
+    key = s.strip().lower()
+    for frag, buck in STATUS_BUCKET_MAP.items():
+        if frag in key:
+            return buck
+    return "Other"
+
+
 # ============================================================================
 # AUTOMATED PREMIUM WRAPPER ENGINE
 # ============================================================================
@@ -96,6 +116,20 @@ def render_premium_chart(chart_func, *args, **kwargs):
         if hasattr(fig, "update_xaxes"):
             fig.update_xaxes(showgrid=False, zeroline=False, title_font=dict(color="#374151", size=10))
             fig.update_yaxes(gridcolor="rgba(0,0,0,0.08)", zeroline=False, title_font=dict(color="#374151", size=10))
+
+        # Data labels on by default: percent+label for pies, percent-of-total
+        # for treemaps, value+percent-of-first-stage for funnels. Bar charts
+        # get their % labels set explicitly at each call site instead (each
+        # one needs its own denominator - "% of all primary doctors", "% of
+        # all postgrad rows", etc. - so one generic rule here can't cover them).
+        trace_types = {trace.type for trace in fig.data}
+        if "pie" in trace_types:
+            fig.update_traces(textinfo="percent+label", textposition="inside", selector=dict(type="pie"))
+        if "treemap" in trace_types:
+            fig.update_traces(textinfo="label+percent entry", selector=dict(type="treemap"))
+        if "funnel" in trace_types:
+            fig.update_traces(textinfo="value+percent initial", selector=dict(type="funnel"))
+
         st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
     except Exception as e:
         logger.error(f"Visualization render bypass: {e}")
@@ -146,7 +180,29 @@ def build_qualifications_table(use_real_db: bool) -> pd.DataFrame:
     result = pd.concat([exploded.drop(columns=["Qualifications"]), qual_df], axis=1)
     result["PassingYear"] = pd.to_numeric(result.get("PassingYear"), errors="coerce")
     result = result[result["PassingYear"].between(1940, 2018, inclusive="both") | result["PassingYear"].isna()]
-    
+
+    # BUG FIX: QualSeq/IsPrimary used to be assigned purely by array position
+    # (cumcount() on the rows in whatever order they came out of the scraped
+    # Qualifications list). Real PMDC records are NOT always stored
+    # chronologically - e.g. one doctor's Qualifications array lists their
+    # 2024 FCPS BEFORE their 2017 MBBS - so array position alone can
+    # misidentify a postgraduate qualification as "primary" and the doctor's
+    # actual base degree as a "secondary" one. This silently corrupted the
+    # primary/secondary split every chart on this page is built from.
+    #
+    # Fixed by sorting each doctor's qualification rows so their base degree
+    # (MBBS/BDS) always comes first if they have one on file, then by
+    # PassingYear (earliest first) as the tiebreaker/fallback for everything
+    # else - THEN assigning QualSeq/IsPrimary from that corrected order.
+    result["_degree_canonical_for_sort"] = result.get("Degree", pd.Series(dtype=str)).apply(canonicalize_degree)
+    result["_is_not_base_degree"] = ~result["_degree_canonical_for_sort"].isin(["MBBS", "BDS"])
+    result = result.sort_values(
+        by=["RegistrationNo", "_is_not_base_degree", "PassingYear"],
+        na_position="last",
+        kind="stable"
+    )
+    result = result.drop(columns=["_degree_canonical_for_sort", "_is_not_base_degree"])
+
     result["QualSeq"] = result.groupby("RegistrationNo").cumcount() + 1
     result["IsPrimary"] = result["QualSeq"] == 1
     
@@ -283,9 +339,12 @@ def render_qualification_analytics():
     with tab1:
         t1_r1_c1, t1_r1_c2 = st.columns(2)
         with t1_r1_c1:
-            deg_counts = exclude_unknown(primary, "Degree")["Degree"].value_counts().reset_index().head(10)
+            deg_pool = exclude_unknown(primary, "Degree")
+            deg_counts = deg_pool["Degree"].value_counts().reset_index().head(10)
             deg_counts.columns = ["Degree", "Count"]
-            render_premium_chart(px.bar, deg_counts, x="Degree", y="Count", title="1. Dominant Primary Degrees", color_discrete_sequence=["#2A9D8F"], text="Count")
+            # % of all doctors with a known primary degree (not just these 10 bars).
+            deg_counts["Pct"] = (deg_counts["Count"] / len(deg_pool) * 100).round(1)
+            render_premium_chart(px.bar, deg_counts, x="Degree", y="Count", title="1. Dominant Primary Degrees", color_discrete_sequence=["#2A9D8F"], text=deg_counts["Pct"].map(lambda p: f"{p}%"))
         with t1_r1_c2:
             yr_counts = primary.dropna(subset=["PassingYear"]).groupby("PassingYear").size().reset_index(name="Volume")
             render_premium_chart(px.area, yr_counts, x="PassingYear", y="Volume", title="2. Graduation Volume Profile Over Time", color_discrete_sequence=["#C9A84C"])
@@ -295,7 +354,9 @@ def render_qualification_analytics():
             render_premium_chart(px.treemap, exclude_unknown(primary, "Degree"), path=["source_label", "Degree"], title="3. Registration Series Flow to Degree Model", color_discrete_sequence=COLOR_SEQ)
         with t1_r2_c2:
             age_df = primary.dropna(subset=["PassingYear"]).copy()
-            age_df["CareerAge"] = 2026 - age_df["PassingYear"]
+            # Was hardcoded to a fixed year (2026) - would silently drift
+            # wrong every year after that. Uses today's actual year instead.
+            age_df["CareerAge"] = datetime.now().year - age_df["PassingYear"]
             age_df = age_df[age_df["CareerAge"].between(0, 70)]
             render_premium_chart(px.histogram, age_df, x="CareerAge", nbins=20, title="4. Career Age Distribution Metrics", color_discrete_sequence=["#E8C547"])
 
@@ -303,7 +364,9 @@ def render_qualification_analytics():
         with t1_r3_c1:
             seq_metrics = filtered["QualSeq"].value_counts().reset_index()
             seq_metrics.columns = ["Sequence", "Records"]
-            render_premium_chart(px.bar, seq_metrics, x="Sequence", y="Records", title="5. Qualification Depth Density Structure", color_discrete_sequence=["#457B9D"])
+            # % of all qualification rows in the current filter.
+            seq_metrics["Pct"] = (seq_metrics["Records"] / total_qual_rows * 100).round(1)
+            render_premium_chart(px.bar, seq_metrics, x="Sequence", y="Records", title="5. Qualification Depth Density Structure", color_discrete_sequence=["#457B9D"], text=seq_metrics["Pct"].map(lambda p: f"{p}%"))
         with t1_r3_c2:
             src_vol = primary["source_label"].value_counts().reset_index()
             src_vol.columns = ["Series", "Volume"]
@@ -324,7 +387,11 @@ def render_qualification_analytics():
                     others_sum = univ_leader.iloc[10:]["Count"].sum()
                     univ_leader = pd.concat([top_part, pd.DataFrame([{"University": "Others", "Count": others_sum}])], ignore_index=True)
                 univ_leader = univ_leader.sort_values("Count", ascending=True)
-                render_premium_chart(px.bar, univ_leader, x="Count", y="University", orientation="h", title="7. Top 10 Primary Academic Sourcing Institutions", color_discrete_sequence=["#2A9D8F"])
+                # % is of ALL primary doctors with a known university (sums to
+                # the same total as univ_leader_full, since "Others" absorbs
+                # everything past the top 10).
+                univ_leader["Pct"] = (univ_leader["Count"] / univ_leader["Count"].sum() * 100).round(1)
+                render_premium_chart(px.bar, univ_leader, x="Count", y="University", orientation="h", title="7. Top 10 Primary Academic Sourcing Institutions", color_discrete_sequence=["#2A9D8F"], text=univ_leader["Pct"].map(lambda p: f"{p}%"))
             else:
                 st.dataframe(univ_leader_full.sort_values("Count", ascending=False), use_container_width=True, hide_index=True, height=340)
         with t1_r4_c2:
@@ -342,7 +409,9 @@ def render_qualification_analytics():
             type_mix_src = primary.copy()
             type_mix_src["RegistrationType"] = type_mix_src["RegistrationType"].astype(str).str.strip().str.title()
             type_mix = type_mix_src.groupby(["source_label", "RegistrationType"]).size().reset_index(name="Volume")
-            render_premium_chart(px.bar, type_mix, x="source_label", y="Volume", color="RegistrationType", barmode="stack", title="10. Operational Scope Mix inside Series", color_discrete_sequence=COLOR_SEQ)
+            # % of all primary doctors (across every series/type combo shown).
+            type_mix["Pct"] = (type_mix["Volume"] / len(type_mix_src) * 100).round(1)
+            render_premium_chart(px.bar, type_mix, x="source_label", y="Volume", color="RegistrationType", barmode="stack", title="10. Operational Scope Mix inside Series", color_discrete_sequence=COLOR_SEQ, text=type_mix["Pct"].map(lambda p: f"{p}%"))
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 2: POSTGRAD & SPECIALTIES
@@ -365,11 +434,16 @@ def render_qualification_analytics():
                 sp_pool = secondary[~secondary["Speciality"].isin(["", ".", "Unknown"])]
                 sp_counts = sp_pool["Speciality"].value_counts().reset_index().head(10)
                 sp_counts.columns = ["Specialty", "Count"]
-                render_premium_chart(px.bar, sp_counts, x="Count", y="Specialty", orientation="h", title="1. Dominant Specialized Domain Matrix", color_discrete_sequence=["#2A9D8F"])
+                # % of all secondary (postgrad) rows with a known specialty.
+                sp_counts["Pct"] = (sp_counts["Count"] / len(sp_pool) * 100).round(1)
+                render_premium_chart(px.bar, sp_counts, x="Count", y="Specialty", orientation="h", title="1. Dominant Specialized Domain Matrix", color_discrete_sequence=["#2A9D8F"], text=sp_counts["Pct"].map(lambda p: f"{p}%"))
             with t2_r1_c2:
-                pg_deg = exclude_unknown(secondary, "Degree")["Degree"].value_counts().reset_index().head(8)
+                pg_deg_pool = exclude_unknown(secondary, "Degree")
+                pg_deg = pg_deg_pool["Degree"].value_counts().reset_index().head(8)
                 pg_deg.columns = ["Postgrad Degree", "Count"]
-                render_premium_chart(px.bar, pg_deg, x="Postgrad Degree", y="Count", title="2. Postgrad Qualification Typology", color_discrete_sequence=["#C9A84C"])
+                # % of all secondary rows with a known postgrad degree.
+                pg_deg["Pct"] = (pg_deg["Count"] / len(pg_deg_pool) * 100).round(1)
+                render_premium_chart(px.bar, pg_deg, x="Postgrad Degree", y="Count", title="2. Postgrad Qualification Typology", color_discrete_sequence=["#C9A84C"], text=pg_deg["Pct"].map(lambda p: f"{p}%"))
 
             t2_r2_c1, t2_r2_c2 = st.columns(2)
             with t2_r2_c1:
@@ -402,7 +476,10 @@ def render_qualification_analytics():
                         others_sum = sec_univ.iloc[10:]["Volume"].sum()
                         sec_univ = pd.concat([top_part, pd.DataFrame([{"Institution": "Others", "Volume": others_sum}])], ignore_index=True)
                     sec_univ = sec_univ.sort_values("Volume", ascending=True)
-                    render_premium_chart(px.bar, sec_univ, x="Volume", y="Institution", orientation="h", title="6. Top 10 Fellowship & Postgrad Training Centers", color_discrete_sequence=["#2A9D8F"])
+                    # % is of ALL secondary rows with a known university (sums
+                    # to the same total as sec_univ_full).
+                    sec_univ["Pct"] = (sec_univ["Volume"] / sec_univ["Volume"].sum() * 100).round(1)
+                    render_premium_chart(px.bar, sec_univ, x="Volume", y="Institution", orientation="h", title="6. Top 10 Fellowship & Postgrad Training Centers", color_discrete_sequence=["#2A9D8F"], text=sec_univ["Pct"].map(lambda p: f"{p}%"))
                 else:
                     st.dataframe(sec_univ_full.sort_values("Volume", ascending=False), use_container_width=True, hide_index=True, height=340)
 
@@ -411,9 +488,18 @@ def render_qualification_analytics():
                 sec_yr = secondary.dropna(subset=["PassingYear"]).groupby("PassingYear").size().reset_index(name="Volume")
                 render_premium_chart(px.line, sec_yr, x="PassingYear", y="Volume", title="7. Historical Postgrad Inflow Accelerations", markers=True, color_discrete_sequence=["#2A9D8F"])
             with t2_r4_c2:
-                spec_status = secondary.groupby(["Degree", "Status"]).size().reset_index(name="Count")
+                # Grouping by raw "Status" text produced 100+ near-duplicate
+                # legend entries (see STATUS_BUCKET_MAP note above) - the
+                # chart was unreadable, bars and legend overlapping. Fixed by
+                # bucketing into a handful of clean categories first.
+                spec_status_src = secondary.copy()
+                spec_status_src["Status_Bucketed"] = spec_status_src["Status"].apply(bucket_status)
+                spec_status_src = spec_status_src[spec_status_src["Status_Bucketed"] != "Other"]
+                spec_status = spec_status_src.groupby(["Degree", "Status_Bucketed"]).size().reset_index(name="Count")
                 spec_status = spec_status[spec_status["Degree"].isin(secondary["Degree"].value_counts().head(4).index)]
-                render_premium_chart(px.bar, spec_status, x="Degree", y="Count", color="Status", barmode="group", title="8. Postgrad License Compliance Grid", color_discrete_sequence=COLOR_SEQ)
+                # % of all secondary (postgrad) rows with a recognized status.
+                spec_status["Pct"] = (spec_status["Count"] / len(spec_status_src) * 100).round(1)
+                render_premium_chart(px.bar, spec_status, x="Degree", y="Count", color="Status_Bucketed", barmode="group", title="8. Postgrad License Compliance Grid", color_discrete_map={"Active": "#2A9D8F", "In-Active": "#64748B", "Suspended": "#C9A84C", "Cancelled": "#EF4444"}, text=spec_status["Pct"].map(lambda p: f"{p}%"))
 
             t2_r5_c1, t2_r5_c2 = st.columns(2)
             with t2_r5_c1:
@@ -423,7 +509,9 @@ def render_qualification_analytics():
                 track_spec_src = secondary.copy()
                 track_spec_src["RegistrationType"] = track_spec_src["RegistrationType"].astype(str).str.strip().str.title()
                 track_spec = track_spec_src.groupby(["source_label", "RegistrationType"]).size().reset_index(name="Count")
-                render_premium_chart(px.bar, track_spec, x="source_label", y="Count", color="RegistrationType", title="10. Specialized Density Vectors Across Series", color_discrete_sequence=["#C9A84C", "#457B9D"])
+                # % of all secondary (postgrad) rows.
+                track_spec["Pct"] = (track_spec["Count"] / len(track_spec_src) * 100).round(1)
+                render_premium_chart(px.bar, track_spec, x="source_label", y="Count", color="RegistrationType", title="10. Specialized Density Vectors Across Series", color_discrete_sequence=["#C9A84C", "#457B9D"], text=track_spec["Pct"].map(lambda p: f"{p}%"))
 
     # ────────────────────────────────────────────────────────────────────────
     # TAB 3: DEMOGRAPHICS INFERRED
@@ -447,17 +535,10 @@ def render_qualification_analytics():
             box_df = primary[primary["Degree"].isin(top_degs)].dropna(subset=["PassingYear"])
             render_premium_chart(px.box, box_df, x="Degree", y="PassingYear", color="Degree", title="3. Cohort Longevity Variations by Degree", showlegend=False)
         with t3_r2_c2:
-            STATUS_BUCKET_MAP = {"active": "Active", "in-active": "In-Active", "inactive": "In-Active", "suspended": "Suspended", "cancelled": "Cancelled", "cancel": "Cancelled"}
-            
-            def bucket_status(s):
-                if not isinstance(s, str):
-                    return "Other"
-                key = s.strip().lower()
-                for frag, buck in STATUS_BUCKET_MAP.items():
-                    if frag in key:
-                        return buck
-                return "Other"
-                
+            # Uses the shared bucket_status() defined near the top of this
+            # file (fixed to check "in-active"/"inactive" before "active",
+            # and shared here to avoid two copies of the same fix drifting
+            # apart).
             primary_b = primary.copy()
             primary_b["Status_Bucketed"] = primary_b["Status"].apply(bucket_status)
             primary_b = primary_b[primary_b["Status_Bucketed"] != "Other"]

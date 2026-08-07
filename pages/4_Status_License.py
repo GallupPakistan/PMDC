@@ -40,10 +40,29 @@ def normalize_reg_type(raw: str) -> str:
     return "Other"
 
 
+def _qual_year_4sl(qual):
+    try:
+        return int(qual.get("PassingYear"))
+    except (TypeError, ValueError):
+        return 9999
+
+
 def get_first_university(quals):
-    if isinstance(quals, list) and len(quals) > 0 and isinstance(quals[0], dict):
-        return quals[0].get("University")
-    return None
+    """Return the doctor's BASE (MBBS/BDS) qualification's university, not
+    just array position 0 - real records aren't always chronologically
+    ordered, so quals[0] can be a postgraduate institution instead of the
+    medical/dental school actually used for Province/Gender inference below.
+    Same fix as Overview/Doctor Analytics/University Insights."""
+    if not (isinstance(quals, list) and len(quals) > 0):
+        return None
+    base_candidates = [q for q in quals if isinstance(q, dict) and str(q.get("Degree", "")).strip().upper()
+                       .replace(" ", "").replace(".", "").replace(",", "") in ("MBBS", "BDS")]
+    if base_candidates:
+        base = min(base_candidates, key=_qual_year_4sl)
+    else:
+        dated = [q for q in quals if isinstance(q, dict) and q.get("PassingYear") not in (None, "")]
+        base = min(dated, key=_qual_year_4sl) if dated else (quals[0] if isinstance(quals[0], dict) else None)
+    return base.get("University") if base else None
 
 
 def exclude_unknown(data: pd.DataFrame, *cols) -> pd.DataFrame:
@@ -305,17 +324,17 @@ def render_status_license():
         r1c1, r1c2 = st.columns(2)
         with r1c1:
             reg_trend = df.dropna(subset=["RegYear"]).groupby("RegYear").size().reset_index(name="Registrations")
-            reg_trend = reg_trend[reg_trend["RegYear"].between(1950, 2026)]
+            reg_trend = reg_trend[reg_trend["RegYear"].between(1950, 2018)]
             safe_plotly_render(px.area(reg_trend, x="RegYear", y="Registrations", title="1. National Aggregate Inflow Vector Over Time", color_discrete_sequence=["#B8860B"]))
         with r1c2:
             reg_by_status = df.dropna(subset=["RegYear"]).groupby(["RegYear", "Status_Norm"]).size().reset_index(name="Volume")
-            reg_by_status = reg_by_status[reg_by_status["RegYear"].between(1950, 2026)]
+            reg_by_status = reg_by_status[reg_by_status["RegYear"].between(1950, 2018)]
             safe_plotly_render(px.line(reg_by_status, x="RegYear", y="Volume", color="Status_Norm", title="2. Registration Volume Trajectory by Status Over Time", color_discrete_map=color_map_status))
 
         r2c1, r2c2 = st.columns(2)
         with r2c1:
             reg_by_type = df.dropna(subset=["RegYear"]).groupby(["RegYear", "RegType_Norm"]).size().reset_index(name="Volume")
-            reg_by_type = reg_by_type[reg_by_type["RegYear"].between(1950, 2026)]
+            reg_by_type = reg_by_type[reg_by_type["RegYear"].between(1950, 2018)]
             safe_plotly_render(px.line(reg_by_type, x="RegYear", y="Volume", color="RegType_Norm", title="3. Historical Trend of Permanent vs Provisional Classes", color_discrete_sequence=palette_list))
         with r2c2:
             cum_trend = reg_trend.copy()
@@ -325,7 +344,7 @@ def render_status_license():
         r3c1, r3c2 = st.columns(2)
         with r3c1:
             reg_gen = exclude_unknown(df.dropna(subset=["RegYear"]), "Gender").groupby(["RegYear", "Gender"]).size().reset_index(name="Volume")
-            reg_gen = reg_gen[reg_gen["RegYear"].between(1950, 2026)]
+            reg_gen = reg_gen[reg_gen["RegYear"].between(1950, 2018)]
             safe_plotly_render(px.line(reg_gen, x="RegYear", y="Volume", color="Gender", title="5. Chronological Registration Influx by Gender Mix", color_discrete_sequence=palette_list))
         with r3c2:
             safe_plotly_render(px.box(df, x="Status_Norm", y="RegYear", title="6. Historical Registration Cohort Density Dispersion Spread", color="Status_Norm", color_discrete_map=color_map_status))
@@ -333,7 +352,7 @@ def render_status_license():
         r4c1, r4c2 = st.columns(2)
         with r4c1:
             reg_src = df.dropna(subset=["RegYear"]).groupby(["RegYear", "source_label"]).size().reset_index(name="Volume")
-            reg_src = reg_src[reg_src["RegYear"].between(1950, 2026)]
+            reg_src = reg_src[reg_src["RegYear"].between(1950, 2018)]
             safe_plotly_render(px.bar(reg_src, x="RegYear", y="Volume", color="source_label", title="7. Historical Influx Share per Data Series Batch", barmode="stack", color_discrete_sequence=palette_list))
         with r4c2:
             safe_plotly_render(px.scatter(reg_by_status, x="RegYear", y="Volume", size="Volume", color="Status_Norm", title="8. Temporal Status Inflow Clustering & Outliers Map", color_discrete_map=color_map_status))

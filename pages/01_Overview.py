@@ -76,13 +76,61 @@ def clean_status(val):
 def normalize_degree_name(degree):
     if pd.isna(degree) or str(degree).strip() in ["", "N/A"]:
         return "N/A"
-    cleaned = str(degree).strip().upper().replace(" ", "").replace(".", "")
+    # Strip spaces, dots AND commas so punctuation variants of the same degree
+    # collapse into one bucket. Without stripping the comma, "M.B.,B.S." became
+    # "MB,BS" after cleaning - the leftover comma broke the "MBBS" substring
+    # match, so it was silently kept as its own separate degree category
+    # instead of merging with "MBBS".
+    cleaned = str(degree).strip().upper().replace(" ", "").replace(".", "").replace(",", "")
     if "MBBS" in cleaned: return "MBBS"
     if "BDS" in cleaned: return "BDS"
     if "FCPS" in cleaned: return "FCPS"
     if "MD" in cleaned: return "MD"
     if "MS" in cleaned: return "MS"
     return str(degree).strip()
+
+
+def _qual_year(qual):
+    """Best-effort PassingYear as an int, for sorting qualifications
+    chronologically. Missing/unparsable years sort last."""
+    try:
+        return int(qual.get("PassingYear"))
+    except (TypeError, ValueError):
+        return 9999
+
+
+def get_base_qualification(quals):
+    """Return the doctor's foundational medical/dental qualification (their
+    MBBS or BDS entry) out of their full Qualifications list.
+
+    This exists because taking qs[0] (whatever the scraper happened to list
+    first) is NOT reliable - real PMDC records are not always stored in
+    chronological order. Example from the actual data: one doctor's
+    Qualifications array lists "FCPS Medicine (2024)" BEFORE "M.B.,B.S.
+    (2017)", even though the MBBS came first in real life. Treating qs[0] as
+    "the primary degree" made that doctor count as an FCPS holder with no
+    MBBS on the Overview charts, and - more generally - let postgraduate
+    qualifications (FCPS/MD/MS, which doctors take *in addition to* MBBS/BDS,
+    not *instead of* it) get counted as if they were a competing, mutually
+    exclusive degree category on the "Dominant Qualifications" chart.
+
+    Selection rule: prefer whichever entry normalizes to MBBS/BDS (earliest
+    one, if a doctor somehow has more than one on file); if none of their
+    entries is MBBS/BDS, fall back to their earliest-dated qualification;
+    if nothing has a usable date either, fall back to array position 0.
+    """
+    if not isinstance(quals, list) or len(quals) == 0:
+        return None
+
+    base_candidates = [q for q in quals if normalize_degree_name(q.get("Degree")) in ("MBBS", "BDS")]
+    if base_candidates:
+        return min(base_candidates, key=_qual_year)
+
+    dated = [q for q in quals if q.get("PassingYear") not in (None, "")]
+    if dated:
+        return min(dated, key=_qual_year)
+
+    return quals[0]
 
 @st.cache_data(ttl=3600)
 def load_and_normalize_overview(use_real_db: bool):
@@ -117,9 +165,10 @@ def _normalize_data(df):
     if "Qualifications" in df.columns:
         def extract_field(qs, field):
             try:
-                if isinstance(qs, list) and len(qs) > 0:
-                    return qs[0].get(field) or "N/A"
-                return "N/A"
+                base = get_base_qualification(qs)
+                if base is None:
+                    return "N/A"
+                return base.get(field) or "N/A"
             except Exception:
                 return "N/A"
         df["Primary_Degree"] = df["Qualifications"].apply(lambda x: extract_field(x, "Degree"))
@@ -359,8 +408,11 @@ def render_overview():
     # Visual 3
     series_counts = df["source_label"].value_counts().reset_index()
     series_counts.columns = ["Series", "Count"]
-    fig3 = px.bar(series_counts.head(6), x="Count", y="Series", orientation="h", title="Registration Volume by Series", 
-                  color_discrete_sequence=["#C9A84C"])
+    top_series = series_counts.head(6).copy()
+    top_series["Pct"] = (top_series["Count"] / len(df) * 100).round(1)
+    fig3 = px.bar(top_series, x="Count", y="Series", orientation="h", title="Registration Volume by Series", 
+                  color_discrete_sequence=["#C9A84C"], text=top_series["Pct"].map(lambda p: f"{p}%"))
+    fig3.update_traces(textposition="outside")
     layout_series = layout_theme.copy()
     layout_series["margin"] = dict(t=50, b=40, l=120, r=20)
     fig3.update_layout(**layout_series)
@@ -388,9 +440,14 @@ def render_overview():
                 others_sum = univ_counts.iloc[10:]["Count"].sum()
                 univ_counts = pd.concat([top_part, pd.DataFrame([{"University": "Others", "Count": others_sum}])], ignore_index=True)
             layout_univ = layout_theme.copy()
-            layout_univ["margin"] = dict(t=50, b=40, l=180, r=20)
+            layout_univ["margin"] = dict(t=50, b=40, l=180, r=40)
+            # % is of ALL local doctors (univ_counts sums to the same total as
+            # univ_leader_full, since "Others" absorbs everything past top 10) -
+            # not just a share of the 11 bars shown.
+            univ_counts["Pct"] = (univ_counts["Count"] / univ_counts["Count"].sum() * 100).round(1)
             fig4 = px.bar(univ_counts, x="Count", y="University", orientation="h", title="Top 10 Local Universities",
-                          color_discrete_sequence=["#2A9D8F"])
+                          color_discrete_sequence=["#2A9D8F"], text=univ_counts["Pct"].map(lambda p: f"{p}%"))
+            fig4.update_traces(textposition="outside")
             fig4.update_layout(**layout_univ)
             fig4.update_yaxes(autorange="reversed")
             st.plotly_chart(fig4, use_container_width=True)
@@ -418,9 +475,13 @@ def render_overview():
                     others_sum = intl_counts.iloc[10:]["Count"].sum()
                     intl_counts = pd.concat([top_part, pd.DataFrame([{"University": "Others", "Count": others_sum}])], ignore_index=True)
                 layout_intl = layout_theme.copy()
-                layout_intl["margin"] = dict(t=50, b=40, l=180, r=20)
+                layout_intl["margin"] = dict(t=50, b=40, l=180, r=40)
+                # Same logic as the Local Universities chart: % is of ALL
+                # international doctors, not just the 11 bars shown.
+                intl_counts["Pct"] = (intl_counts["Count"] / intl_counts["Count"].sum() * 100).round(1)
                 fig4b = px.bar(intl_counts, x="Count", y="University", orientation="h", title="Top 10 International Universities",
-                              color_discrete_sequence=["#E8C547"])
+                              color_discrete_sequence=["#E8C547"], text=intl_counts["Pct"].map(lambda p: f"{p}%"))
+                fig4b.update_traces(textposition="outside")
                 fig4b.update_layout(**layout_intl)
                 fig4b.update_yaxes(autorange="reversed")
                 st.plotly_chart(fig4b, use_container_width=True)
@@ -431,9 +492,15 @@ def render_overview():
 
     c5, c6 = st.columns(2)
     with c5:
+        known_degree_total = (df["Primary_Degree"] != "N/A").sum()
         deg_counts = df[df["Primary_Degree"] != "N/A"]["Primary_Degree"].value_counts().reset_index().head(5)
         deg_counts.columns = ["Degree", "Count"]
-        fig5 = px.bar(deg_counts, x="Degree", y="Count", title="Dominant Qualifications", color_discrete_sequence=["#E8C547"])
+        # % of all doctors with a known base degree (not just these 5 bars) -
+        # matches how the University charts' percentages are computed above.
+        deg_counts["Pct"] = (deg_counts["Count"] / known_degree_total * 100).round(1)
+        fig5 = px.bar(deg_counts, x="Degree", y="Count", title="Dominant Qualifications", color_discrete_sequence=["#E8C547"],
+                      text=deg_counts["Pct"].map(lambda p: f"{p}%"))
+        fig5.update_traces(textposition="outside")
         fig5.update_layout(**layout_theme)
         st.plotly_chart(fig5, use_container_width=True)
         st.markdown("<p class='insight-text'>Type of medical or dental degrees most commonly held in the database.</p>", unsafe_allow_html=True)
@@ -459,13 +526,31 @@ def render_overview():
     
     c5, c6 = st.columns(2)
     reg_year = df.dropna(subset=["Year"]).copy()
-    reg_year = reg_year[(reg_year["Year"] >= 1990) & (reg_year["Year"] <= datetime.now().year)]
+    # Capped at 2018 to match the data horizon used consistently across the
+    # rest of the dashboard (Qualification Analytics, University Insights,
+    # Gender & Specialization Deep Dive, Yearly Deep Dive all cap at 2018 -
+    # see MAX_YEAR in those pages). Registrations after 2018 aren't shown
+    # here for the same reason they're excluded elsewhere.
+    reg_year = reg_year[(reg_year["Year"] >= 1990) & (reg_year["Year"] <= 2018)]
     
     with c5:
         reg_by_year = reg_year.groupby("Year").size().reset_index(name="Registrations")
         fig7 = px.line(reg_by_year, x="Year", y="Registrations", title="Yearly Registration Velocity", 
                        color_discrete_sequence=["#C9A84C"], markers=True)
         fig7.update_layout(**layout_theme)
+        # Force x-axis ticks to always reach the actual last data year.
+        # Plotly's auto-tick algorithm picks "nice" round intervals (every 5
+        # years here) and sometimes stops short of the real max year if it
+        # doesn't land on one of those round numbers - e.g. data going up to
+        # 2021 only got labeled ticks up to 2015, silently hiding that the
+        # line continues (with real, non-zero registrations) past 2015.
+        if not reg_by_year.empty:
+            year_min = int(reg_by_year["Year"].min())
+            year_max = int(reg_by_year["Year"].max())
+            tick_vals = list(range((year_min // 5) * 5, year_max + 1, 5))
+            if tick_vals[-1] != year_max:
+                tick_vals.append(year_max)
+            fig7.update_xaxes(tickmode="array", tickvals=tick_vals)
         st.plotly_chart(fig7, use_container_width=True)
         st.markdown("<p class='insight-text'>Timeline trajectory showing how fast new doctors register year after year.</p>", unsafe_allow_html=True)
 
@@ -481,47 +566,17 @@ def render_overview():
         st.markdown("<p class='insight-text'>Percentage of doctors registered in a specific year who still remain active.</p>", unsafe_allow_html=True)
 
 
-    # ─── SECTION 4: CRITICAL OPERATIONS (Visual 9 & 10) ───
-    st.markdown("<div class='section-header'>4. Critical Actions & Expiring Warnings</div>", unsafe_allow_html=True)
-    
-    c7, c8 = st.columns([1, 1.2])
-    with c7:
-        yoy = reg_year.groupby("Year").size().reset_index(name="Count")
-        yoy["Growth_Rate"] = yoy["Count"].pct_change() * 100
-        yoy = yoy.dropna().tail(15)
-        fig9 = px.bar(yoy, x="Year", y="Growth_Rate", title="Year-over-Year Growth Rate (%)", color_discrete_sequence=["#EF4444"])
-        fig9.add_hline(y=0, line_color="rgba(148,163,184,0.4)")
-        fig9.update_layout(**layout_theme)
-        st.plotly_chart(fig9, use_container_width=True)
-        st.markdown("<p class='insight-text'>Year-on-year percentage shift in registrations.</p>", unsafe_allow_html=True)
+    # ─── SECTION 4: YEAR-OVER-YEAR GROWTH (Visual 9) ───
+    st.markdown("<div class='section-header'>4. Year-over-Year Growth</div>", unsafe_allow_html=True)
 
-    with c8:
-        st.markdown("<p style='color:#9A6B00; font-weight:600; font-size:1rem; margin-bottom:5px;'>⚠️ License Expiry Monitoring (Next 90 Days)</p>", unsafe_allow_html=True)
-        
-        if "DaysToExpiry" in df.columns and not df.empty:
-            urgent = df[(df["DaysToExpiry"] >= 0) & (df["DaysToExpiry"] <= 90)].sort_values("DaysToExpiry").head(15)
-        else:
-            urgent = pd.DataFrame()
-        
-        if not urgent.empty:
-            display_cols = [col for col in ["Name", "Primary_Degree", "ValidUpto", "DaysToExpiry"] if col in urgent.columns]
-            st.dataframe(
-                urgent[display_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Name": "Doctor Name",
-                    "Primary_Degree": "Degree",
-                    "ValidUpto": "Expiry Date",
-                    "DaysToExpiry": st.column_config.ProgressColumn(
-                        "Days Left",
-                        min_value=0, max_value=90, format="%d days"
-                    )
-                }
-            )
-            st.markdown("<p class='insight-text' style='margin-top:5px;'>List of practitioners requiring immediate notification.</p>", unsafe_allow_html=True)
-        else:
-            st.success("✅ Excellent! All checked data rows show valid licenses yards beyond 90 days.")
+    yoy = reg_year.groupby("Year").size().reset_index(name="Count")
+    yoy["Growth_Rate"] = yoy["Count"].pct_change() * 100
+    yoy = yoy.dropna().tail(15)
+    fig9 = px.bar(yoy, x="Year", y="Growth_Rate", title="Year-over-Year Growth Rate (%)", color_discrete_sequence=["#EF4444"])
+    fig9.add_hline(y=0, line_color="rgba(148,163,184,0.4)")
+    fig9.update_layout(**layout_theme)
+    st.plotly_chart(fig9, use_container_width=True)
+    st.markdown("<p class='insight-text'>Year-on-year percentage shift in registrations.</p>", unsafe_allow_html=True)
 
 # ============================================================================
 # EXECUTION TRIGGER

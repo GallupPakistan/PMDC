@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import re
 import logging
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -49,7 +50,10 @@ SOURCE_LABEL_MAP = {
     "doctors_ajk_series": "AJK-Series",
 }
 
-PASSING_YEAR_MIN, PASSING_YEAR_MAX = 1940, 2026
+# Upper bound was hardcoded to a fixed year (2026) - would silently start
+# rejecting legitimate future-year data (or stop being a meaningful anomaly
+# check at all) once the calendar moved past it. Uses today's actual year.
+PASSING_YEAR_MIN, PASSING_YEAR_MAX = 1940, datetime.now().year
 
 # ============================================================================
 # DATA LOADING
@@ -431,7 +435,11 @@ def render_data_quality():
                     trend_df["Reg_Year"] = trend_df["RegistrationDate_parsed"].dt.year
                     trend_group = trend_df.groupby("Reg_Year").agg(Total=("RegistrationNo", "count"), Clean=("Missing_Core_Fields", lambda x: (x == 0).sum())).reset_index()
                     trend_group["Quality_Rate"] = (trend_group["Clean"] / trend_group["Total"]) * 100
-                    trend_group = trend_group[(trend_group["Reg_Year"] >= 2010) & (trend_group["Reg_Year"] <= 2026)]
+                    # Capped at 2018 to match the data horizon used consistently
+                    # across the rest of the dashboard (this page's own sidebar
+                    # Registration Year slicer already defaults/caps at 2018 -
+                    # this chart was inconsistently going to 2026 instead).
+                    trend_group = trend_group[(trend_group["Reg_Year"] >= 2010) & (trend_group["Reg_Year"] <= 2018)]
                     if not trend_group.empty:
                         safe_render_chart(px.line(trend_group, x="Reg_Year", y="Quality_Rate", title="8. Ingestion Integrity Performance Over Time", markers=True, color_discrete_sequence=["#E8C547"]))
                     else:

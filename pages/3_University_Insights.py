@@ -92,10 +92,40 @@ def exclude_unknown(data: pd.DataFrame, *cols) -> pd.DataFrame:
 # DATA LOADING + TRANSFORM
 # ============================================================================
 def flatten_qualifications(df: pd.DataFrame) -> pd.DataFrame:
+    def _qual_year(qual):
+        try:
+            return int(qual.get("PassingYear"))
+        except (TypeError, ValueError):
+            return 9999
+
     def get_first_qual(quals, key):
-        if isinstance(quals, list) and len(quals) > 0 and isinstance(quals[0], dict):
-            return quals[0].get(key)
-        return None
+        """Return the doctor's BASE (MBBS/BDS) qualification's field, not
+        just whichever entry happens to be array position 0.
+
+        BUG FIX: real PMDC records aren't always stored chronologically -
+        e.g. a doctor's postgraduate FCPS/MD entry can be listed BEFORE
+        their actual MBBS/BDS. Blindly taking quals[0] then meant 11,000+
+        doctors had their "primary" university/degree on this page showing
+        their POSTGRAD institution instead of the medical/dental school they
+        actually attended - a meaningful problem specifically on a page
+        about university sourcing. Fixed by preferring whichever entry
+        canonicalizes to MBBS/BDS (earliest such entry if more than one is
+        on file), falling back to the earliest-dated entry, then to
+        position 0, same approach used on the Overview/Doctor Analytics
+        pages.
+        """
+        if not (isinstance(quals, list) and len(quals) > 0):
+            return None
+        base_candidates = [q for q in quals if isinstance(q, dict)
+                           and canonicalize_degree(q.get("Degree")) in ("MBBS", "BDS")]
+        if base_candidates:
+            base = min(base_candidates, key=_qual_year)
+        else:
+            dated = [q for q in quals if isinstance(q, dict) and q.get("PassingYear") not in (None, "")]
+            base = min(dated, key=_qual_year) if dated else (quals[0] if isinstance(quals[0], dict) else None)
+        if base is None:
+            return None
+        return base.get(key)
 
     df = df.copy()
     df["Qualification_1_Speciality"] = df["Qualifications"].apply(lambda q: get_first_qual(q, "Speciality"))
@@ -213,6 +243,23 @@ def render_premium_chart(chart_func, *args, **kwargs):
             # Ensure text labels on axis ticks are dark and readable on white
             fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color="#374151"))
             fig.update_yaxes(gridcolor="rgba(0,0,0,0.08)", zeroline=False, tickfont=dict(color="#374151"))
+
+            # Force x-axis ticks to reach the actual max data year for
+            # year-based charts (same fix applied dashboard-wide): Plotly's
+            # auto-tick sometimes stops short of the real max year, silently
+            # hiding the tail end of the line/bars/area.
+            x_values = []
+            for trace in fig.data:
+                xs = getattr(trace, "x", None)
+                if xs is None:
+                    continue
+                x_values.extend(v for v in xs if isinstance(v, (int, float)) and not pd.isna(v))
+            if x_values and 1900 <= min(x_values) and max(x_values) <= 2100:
+                year_min, year_max = int(min(x_values)), int(max(x_values))
+                tick_vals = list(range((year_min // 5) * 5, year_max + 1, 5))
+                if tick_vals[-1] != year_max:
+                    tick_vals.append(year_max)
+                fig.update_xaxes(tickmode="array", tickvals=tick_vals)
             
         if custom_legend is not None:
             fig.update_layout(legend=custom_legend)
