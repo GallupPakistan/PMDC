@@ -188,6 +188,15 @@ def render_gender_specialization_deep_dive():
     known_g = df[df["Gender"] != "Unknown"]
     known_p = df[df["Province"] != "Unknown"]
 
+    # "Any specialist" = registered under PMDC's Specialist Series OR has a
+    # declared postgrad degree on file. Computed once, up top, so every
+    # section on this page (the national/province/year breakdowns AND the
+    # by-gender rate) uses the exact same definition and the numbers are
+    # always mutually consistent with each other.
+    df["Is_Specialist_Any"] = df["Is_Specialist_Series"] | df["Is_Specialist"]
+    known_g = known_g.copy()
+    known_g["Is_Specialist_Any"] = df.loc[known_g.index, "Is_Specialist_Any"]
+
     # ------------------------------------------------------------------
     # 1. Overall gender split — BOTH genders shown (this is a two-sided split)
     # ------------------------------------------------------------------
@@ -257,6 +266,29 @@ def render_gender_specialization_deep_dive():
     st.markdown("<p class='insight-text' style='color:#6B7280;font-size:0.8rem;font-style:italic;'>"
                 "AJK is ground-truth (from the AJK-series registry). Other provinces are inferred from primary university.</p>",
                 unsafe_allow_html=True)
+
+    # --- Added per review: province-wise TREND over the years, not just the
+    # current snapshot above (e.g. has Punjab always been this male, or is
+    # it moving?). Shown for the provinces with enough gender-known,
+    # dated records per year to be a reliable trend line. ---
+    st.markdown("#### Gender Split by Province, Over Time")
+    pg_yr = pg[pg["RegYear"].between(1990, MAX_YEAR)]
+    prov_yr_wide = pg_yr.groupby(["RegYear", "Province", "Gender"]).size().unstack(fill_value=0)
+    prov_yr_wide["Total"] = prov_yr_wide.sum(axis=1)
+    prov_yr_wide["Female_%"] = (prov_yr_wide.get("Female", 0) / prov_yr_wide["Total"] * 100).round(1)
+    prov_yr_wide = prov_yr_wide.reset_index()
+    # Keep provinces with a reasonable volume of yearly records - a province
+    # with only a handful of doctors per year produces a noisy, meaningless
+    # line rather than a real trend.
+    reliable_provinces = pg_yr["Province"].value_counts()
+    reliable_provinces = reliable_provinces[reliable_provinces >= 100].index.tolist()
+    prov_yr_plot = prov_yr_wide[prov_yr_wide["Province"].isin(reliable_provinces)]
+    render_premium_chart(px.line, prov_yr_plot, x="RegYear", y="Female_%", color="Province", markers=True,
+                          title=f"Female Share of New Registrations, By Province & Year (through {MAX_YEAR})",
+                          chart_height=440)
+    st.markdown("<p class='insight-text' style='color:#6B7280;font-size:0.8rem;font-style:italic;'>"
+                "Provinces with too few yearly records to form a reliable trend are omitted from this chart "
+                "(but still included in the snapshot above).</p>", unsafe_allow_html=True)
 
     # ------------------------------------------------------------------
     # 4. % pursuing more than MBBS — not a gender split, no gender shown.
@@ -333,6 +365,32 @@ def render_gender_specialization_deep_dive():
                 unsafe_allow_html=True)
     n_spec_text = int(df["Is_Specialist"].sum())  # still used below for the degree-type breakdown
 
+    # --- Added per review: same "any specialist" question (Specialist
+    # Series OR a declared postgrad degree), broken down by province and by
+    # year, instead of only the one national number above. ---
+    st.markdown("#### Specialization Rate by Province")
+    spec_prov = df[df["Province"] != "Unknown"]
+    prov_spec_tab = spec_prov.groupby("Province")["Is_Specialist_Any"].agg(Specialists="sum", Total="count")
+    prov_spec_tab["Specialization_Rate_%"] = (prov_spec_tab["Specialists"] / prov_spec_tab["Total"] * 100).round(2)
+    prov_spec_tab = prov_spec_tab.sort_values("Specialization_Rate_%", ascending=False)
+    render_premium_chart(px.bar, prov_spec_tab.reset_index(), x="Province", y="Specialization_Rate_%", text_auto=".1f",
+                          title="% of Doctors Who Have Specialized, By Province",
+                          color_discrete_sequence=["#2A9D8F"])
+    st.dataframe(prov_spec_tab, use_container_width=True)
+
+    st.markdown("#### Specialization Rate Over the Years")
+    st.caption("By registration year - of doctors who registered in a given year, what share have (as of now) gone on to specialize.")
+    spec_yr = df[df["RegYear"].between(1990, MAX_YEAR)]
+    yr_spec_tab = spec_yr.groupby("RegYear")["Is_Specialist_Any"].agg(Specialists="sum", Total="count")
+    yr_spec_tab["Specialization_Rate_%"] = (yr_spec_tab["Specialists"] / yr_spec_tab["Total"] * 100).round(2)
+    render_premium_chart(px.line, yr_spec_tab.reset_index(), x="RegYear", y="Specialization_Rate_%", markers=True,
+                          title=f"% of Doctors Who Have Specialized, By Registration Year (through {MAX_YEAR})",
+                          color_discrete_sequence=["#C9A84C"])
+    st.markdown("<p class='insight-text' style='color:#6B7280;font-size:0.8rem;font-style:italic;'>"
+                "Recent registration years naturally show a lower rate here - a doctor who registered in 2017 "
+                "has had far less time to complete a postgraduate qualification than one who registered in 1995.</p>",
+                unsafe_allow_html=True)
+
     st.markdown("#### Specialization Degree Types")
     deg_counts = df["Specialist_Degree"].dropna()
     deg_counts = deg_counts[deg_counts != "Unknown"].value_counts()
@@ -363,8 +421,8 @@ def render_gender_specialization_deep_dive():
             shown = pd.concat([shown, others_row], ignore_index=True)
         shown = shown.sort_values("Doctors", ascending=False)
 
-        render_premium_chart(px.bar, shown, x="Degree", y="Doctors", text_auto=True,
-                              title="Specialists by Degree Type (Top 10 + Others)",
+        render_premium_chart(px.bar, shown, x="Degree", y="% of Specialists", text_auto=".1f",
+                              title="Specialists by Degree Type — % of All Specialists (Top 10 + Others)",
                               color_discrete_sequence=["#457B9D"])
         st.dataframe(shown, use_container_width=True, hide_index=True)
         st.markdown("<p class='insight-text' style='color:#6B7280;font-size:0.8rem;font-style:italic;'>"
@@ -378,12 +436,26 @@ def render_gender_specialization_deep_dive():
     # 5. Men vs women specialization rate — BOTH genders shown
     # ------------------------------------------------------------------
     st.markdown("### Specialization Rate by Gender")
-    sr = known_g.groupby("Gender")["Is_Specialist"].agg(Specialists="sum", Total="count")
+    # BUG FIX (per review): this used to compute the rate using ONLY
+    # "Is_Specialist" (declared postgrad degree on file), while Question 4
+    # above defines "has specialized" more broadly as Specialist Series OR
+    # declared degree - two DIFFERENT definitions of "specialist" being used
+    # for what looked like the same underlying question. That's why the
+    # numbers looked mathematically impossible: an overall rate of ~48%
+    # cannot be made up of a 16% female rate and a 26% male rate - no
+    # weighted average of those two numbers gets anywhere near 48%.
+    # Fixed by using the same Is_Specialist_Any definition as Q4, so this
+    # rate is directly consistent with the overall figure above.
+    sr = known_g.groupby("Gender")["Is_Specialist_Any"].agg(Specialists="sum", Total="count")
     sr["Specialization_Rate_%"] = (sr["Specialists"] / sr["Total"] * 100).round(2)
     render_premium_chart(px.bar, sr.reset_index(), x="Gender", y="Specialization_Rate_%", text_auto=".2f",
                           title="Specialization Rate by Gender", color="Gender",
                           color_discrete_sequence=["#E8C547", "#2A9D8F"])
     st.dataframe(sr, use_container_width=True)
+    st.markdown("<p class='insight-text' style='color:#6B7280;font-size:0.8rem;font-style:italic;'>"
+                "Uses the same 'Specialist Series OR declared postgrad degree' definition as the "
+                "Specialization Overview above, so this is directly comparable to the ~48% overall figure there.</p>",
+                unsafe_allow_html=True)
 
     # ------------------------------------------------------------------
     # 6. Specialists by field — no gender dimension here
