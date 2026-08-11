@@ -205,6 +205,20 @@ UNIVERSITY_PROVINCE_MAP = {
     "amna inayat medical college": "Punjab", "sargodha medical college": "Punjab",
     "quaid-e-azam medical college": "Punjab", "faisalabad medical university": "Punjab",
     "punjab medical university": "Punjab",
+    # --- Added: real, high-volume Punjab institutions that were being
+    # silently dropped to "Unknown" because the scraped spelling abbreviates
+    # "University"/"Medical" ("univ.", "uni.", "med.") differently than the
+    # exact phrases above expected - e.g. "UNI.OF HEALTH SCIENCES LHR" (38,128
+    # doctors!) never matched "university of health sciences" as a literal
+    # substring. These use short, robust keywords instead of full names so
+    # abbreviation differences no longer matter. ---
+    "uni.of health sciences": "Punjab", "uni. of health sciences": "Punjab",
+    "king edward": "Punjab", "islamia uni": "Punjab", "islamia university": "Punjab",
+    "bahauddin zakariya": "Punjab", "the university of lahore": "Punjab",
+    "fatima jinnah medical uni": "Punjab", "national uni.of medical sciences": "Punjab",
+    "national university of medical sciences rwp": "Punjab",
+    "university of lahore": "Punjab", "superior college": "Punjab",
+    "university of gujrat": "Punjab", "university of sargodha": "Punjab",
     # Sindh
     "dow university of health sciences": "Sindh", "jinnah sindh medical university": "Sindh",
     "liaquat university of medical": "Sindh", "liaquat national medical college": "Sindh",
@@ -215,6 +229,19 @@ UNIVERSITY_PROVINCE_MAP = {
     "isra university": "Sindh", "muhammad medical college": "Sindh",
     "chandka medical college": "Sindh", "al-tibri medical college": "Sindh",
     "peoples medical college": "Sindh", "karachi university": "Sindh",
+    # --- Added: real, high-volume Sindh institutions missed for the same
+    # abbreviation-mismatch reason (e.g. "SINDH UNIVERSITY JAMSHORO" - 22,360
+    # doctors - and "DOW UNIV.OF H.SCIENCES KHI" - 10,008 - never matched). ---
+    "sindh university": "Sindh", "university of sindh": "Sindh",
+    "liaquat univ": "Sindh", "dow univ": "Sindh", "dow uni": "Sindh",
+    "baqai university": "Sindh", "aga khan univ": "Sindh",
+    "hamdard university": "Sindh", "hamdard uni": "Sindh",
+    "s.m.b.b": "Sindh", "smbb": "Sindh",
+    "shaheed mohtarma benazir bhutto medical": "Sindh",
+    "ziauddin med": "Sindh", "ziauddin uni": "Sindh",
+    "peoples uni": "Sindh", "isra uni": "Sindh",
+    "sir syed university": "Sindh", "jinnah medical": "Sindh",
+    "jinnah sindh": "Sindh", "muhammad medical": "Sindh",
     # KPK
     "khyber medical university": "KPK", "khyber medical college": "KPK",
     "khyber girls medical college": "KPK", "ayub medical college": "KPK",
@@ -223,9 +250,20 @@ UNIVERSITY_PROVINCE_MAP = {
     "nowshera medical college": "KPK", "women medical college": "KPK",
     "rehman medical college": "KPK", "frontier medical college": "KPK",
     "swat medical college": "KPK", "northwest school of medicine": "KPK",
+    # --- Added: real, high-volume KP institutions missed - this was the
+    # specific gap the reviewer flagged ("KP has had medical colleges
+    # forever"). "University of Peshawar" alone (12,651 doctors) and
+    # "KHYBER MED.UNIV.PESHAWAR" (2,748) were both going to "Unknown". ---
+    "university of peshawar": "KPK", "khyber med": "KPK", "khyber uni": "KPK",
+    "gandhara univ": "KPK", "gandhara university": "KPK",
+    "hazara university": "KPK", "hazara uni": "KPK",
+    "abbottabad": "KPK", "kohat university": "KPK", "kmu ": "KPK",
+    "peshawar medical college": "KPK", "bacha khan medical": "KPK",
+    "jinnah medical college peshawar": "KPK",
     # Balochistan
     "bolan university of medical": "Balochistan", "bolan medical college": "Balochistan",
     "loralai medical college": "Balochistan", "quetta": "Balochistan",
+    "university of balochistan": "Balochistan",
     # Islamabad
     "shaheed zulfiqar ali bhutto medical university": "Islamabad", "pims": "Islamabad",
     "shifa college of medicine": "Islamabad", "islamic international medical college": "Islamabad",
@@ -233,8 +271,20 @@ UNIVERSITY_PROVINCE_MAP = {
     "yusra medical": "Islamabad", "federal medical college": "Islamabad",
     "capital university of medical sciences": "Islamabad", "national university of medical sciences": "Islamabad",
     "rawal institute of health sciences": "Islamabad", "army medical college": "Islamabad",
+    # --- Added: real, high-volume Islamabad institutions missed - includes
+    # the Islamabad campus of Bahria University (2,742 doctors), which is a
+    # DIFFERENT campus from "bahria university medical" (Sindh/Karachi)
+    # above - kept as its own distinct, unambiguous keyword so the two
+    # campuses don't collide. ---
+    "bahria univ. islamabad": "Islamabad", "bahria university islamabad": "Islamabad",
+    "riphah": "Islamabad", "national university of sciences and technology": "Islamabad",
+    "nust": "Islamabad", "foundation univ": "Islamabad",
+    "shifa tameer": "Islamabad", "quaid-e-azam university": "Islamabad",
+    "shaheed zulfiqar ali bhutto med": "Islamabad",
     # AJK (university-name fallback; series-based override below is authoritative)
     "azad jammu and kashmir medical college": "AJK", "mohtarma benazir bhutto shaheed medical college": "AJK",
+    "mohi ud din islamic university": "AJK", "mohiuddin islamic university": "AJK",
+    "university of azad jammu": "AJK", "poonch medical college": "AJK",
 }
 
 
