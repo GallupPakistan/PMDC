@@ -1,0 +1,51 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    - cron: "42 */6 * * *"   # har 6 ghante mein chalega
+  workflow_dispatch:   # manual trigger ka option
+
+jobs:
+  wake-and-ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visit app and wake if sleeping
+        continue-on-error: true
+        run: |
+          python <<'EOF'
+          from playwright.sync_api import sync_playwright
+
+          APP_URL = "https://pmdc-workforce-analytics.streamlit.app/"  # e.g. https://phc-dasboard-xxxx.streamlit.app/
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              print(f"Visiting {APP_URL} ...")
+              page.goto(APP_URL, wait_until="networkidle", timeout=60000)
+
+              # Check if the "wake up" button exists (app is sleeping)
+              wake_button = page.get_by_text("get this app back up", exact=False)
+              try:
+                  wake_button.wait_for(state="visible", timeout=5000)
+                  print("App is sleeping — clicking wake-up button...")
+                  wake_button.click()
+                  page.wait_for_timeout(15000)  # wait for app to boot
+                  print("Wake-up click sent.")
+              except Exception:
+                  print("No sleep button found — app was already awake.")
+
+              browser.close()
+          EOF
+
+      - name: Done
+        run: echo "Ping/wake attempt finished."
